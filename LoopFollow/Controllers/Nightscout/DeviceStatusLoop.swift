@@ -61,17 +61,22 @@ extension MainViewController {
         var total = 0.0
         var current = startTime
         while current < endTime {
-            let dayStart = calendar.startOfDay(for: Date(timeIntervalSince1970: current)).timeIntervalSince1970
+            let dayStartDate = calendar.startOfDay(for: Date(timeIntervalSince1970: current))
+            let dayStart = dayStartDate.timeIntervalSince1970
+            // The real end of this calendar day, 23 or 25 hours long when daylight saving
+            // changes. Stepping +86 400 s instead never leaves the 25-hour day, and the loop
+            // would never finish on the main thread. Always past `current`, so it ends.
+            let dayEnd = max(calendar.date(byAdding: .day, value: 1, to: dayStartDate)?.timeIntervalSince1970 ?? dayStart + 86400, current + 1)
             for i in 0 ..< sorted.count {
                 let segStart = dayStart + sorted[i].timeAsSeconds
-                let segEnd = i < sorted.count - 1 ? dayStart + sorted[i + 1].timeAsSeconds : dayStart + 86400
+                let segEnd = i < sorted.count - 1 ? min(dayStart + sorted[i + 1].timeAsSeconds, dayEnd) : dayEnd
                 let clampedStart = max(current, segStart)
                 let clampedEnd = min(endTime, segEnd)
                 if clampedEnd > clampedStart {
                     total += sorted[i].value * (clampedEnd - clampedStart) / 3600.0
                 }
             }
-            current = dayStart + 86400
+            current = dayEnd
         }
         return total
     }
