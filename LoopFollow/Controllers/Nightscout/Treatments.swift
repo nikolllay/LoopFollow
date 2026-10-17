@@ -4,6 +4,39 @@
 import Foundation
 
 extension MainViewController {
+    private struct TreatmentOccurrence: Hashable {
+        let id: String
+        let eventType: String?
+        let date: Date?
+    }
+
+    /// Nightscout duplicates can have different MongoDB `_id` values. Trio FPU siblings share an `id` but have distinct
+    /// times, so deduplicate by logical occurrence rather than `id`.
+    static func deduplicatedTreatmentEntries(_ entries: [[String: AnyObject]]) -> [[String: AnyObject]] {
+        var seenOccurrences = Set<TreatmentOccurrence>()
+        return entries.filter { entry in
+            guard let id = entry["id"] as? String, !id.isEmpty else { return true }
+            let eventType = entry["eventType"] as? String
+            let occurrence = TreatmentOccurrence(
+                id: id,
+                eventType: eventType,
+                date: treatmentOccurrenceDate(entry, eventType: eventType)
+            )
+            return seenOccurrences.insert(occurrence).inserted
+        }
+    }
+
+    private static func treatmentOccurrenceDate(_ entry: [String: AnyObject], eventType: String?) -> Date? {
+        let rawDate: String?
+        switch eventType {
+        case "Pump Site Change", "Site Change", "Sensor Start", "Insulin Change":
+            rawDate = entry["created_at"] as? String
+        default:
+            rawDate = (entry["timestamp"] as? String) ?? (entry["created_at"] as? String)
+        }
+        return rawDate.flatMap(NightscoutUtils.parseDate)
+    }
+
     // NS Treatments Web Call
     // Downloads Basal, Bolus, Carbs, BG Check, Notes, Overrides
     func WebLoadNSTreatments() {
@@ -35,6 +68,8 @@ extension MainViewController {
 
     // Process and split out treatments to individual tasks
     func updateTreatments(entries: [[String: AnyObject]]) {
+        let uniqueEntries = Self.deduplicatedTreatmentEntries(entries)
+
         var tempBasal: [[String: AnyObject]] = []
         var bolus: [[String: AnyObject]] = []
         var smb: [[String: AnyObject]] = []
@@ -49,7 +84,7 @@ extension MainViewController {
         var cgmSensorStart: [sageData] = []
         var insulinCartridge: [iageData] = []
 
-        for entry in entries {
+        for entry in uniqueEntries {
             guard let eventType = entry["eventType"] as? String else {
                 continue
             }

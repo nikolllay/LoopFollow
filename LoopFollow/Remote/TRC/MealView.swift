@@ -20,6 +20,7 @@ struct MealView: View {
     @ObservedObject private var mealWithBolus = Storage.shared.mealWithBolus
     @ObservedObject private var mealWithFatProtein = Storage.shared.mealWithFatProtein
     @ObservedObject private var maxBolus = Storage.shared.maxBolus
+    @ObservedObject private var quickPickMeals = QuickPickMealsManager.shared
 
     @FocusState private var carbsFieldIsFocused: Bool
     @FocusState private var proteinFieldIsFocused: Bool
@@ -46,6 +47,40 @@ struct MealView: View {
         NavigationView {
             VStack {
                 Form {
+                    if !quickPickMeals.quickPickMeals.isEmpty {
+                        Section(header: QuickPickSectionHeader(title: "Quick-Pick Meals", infoText: QuickPickSectionHeader.mealInfoText)) {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 12) {
+                                    ForEach(quickPickMeals.quickPickMeals) { meal in
+                                        Button {
+                                            applyQuickPickMeal(meal)
+                                        } label: {
+                                            VStack(spacing: 2) {
+                                                Text("\(Int(meal.carbs))g")
+                                                    .font(.subheadline.weight(.medium))
+                                                if mealWithFatProtein.value, meal.fat > 0 || meal.protein > 0 {
+                                                    Text("F\(Int(meal.fat)) P\(Int(meal.protein))")
+                                                        .font(.caption2)
+                                                }
+                                                if mealWithBolus.value, meal.bolus > 0 {
+                                                    Text("\(InsulinFormatter.shared.string(meal.bolus))U")
+                                                        .font(.caption2)
+                                                }
+                                            }
+                                            .padding(.horizontal, 14)
+                                            .padding(.vertical, 8)
+                                            .background(Color.accentColor.opacity(0.15))
+                                            .foregroundColor(.accentColor)
+                                            .cornerRadius(8)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+
                     Section(header: Text("Meal Data")) {
                         // TODO: This banner can be deleted in March 2027. Check the commit for other places to cleanup.
                         if showFatProteinOrderBanner {
@@ -186,6 +221,11 @@ struct MealView: View {
                 selectedTime = nil
                 isScheduling = false
 
+                quickPickMeals.refresh(
+                    maxCarbs: maxCarbs.value.doubleValue(for: .gram()),
+                    includeFatProtein: mealWithFatProtein.value
+                )
+
                 if !Storage.shared.hasSeenFatProteinOrderChange.value && Storage.shared.mealWithFatProtein.value {
                     showFatProteinOrderBanner = true
                 }
@@ -259,7 +299,7 @@ struct MealView: View {
                     )
                 case .statusSuccess:
                     return Alert(
-                        title: Text("Status"),
+                        title: Text("Command Sent"),
                         message: Text(statusMessage ?? ""),
                         dismissButton: .default(Text("OK"), action: {
                             presentationMode.wrappedValue.dismiss()
@@ -313,7 +353,16 @@ struct MealView: View {
             DispatchQueue.main.async {
                 isLoading = false
                 if success {
-                    statusMessage = "Meal command sent successfully."
+                    let sentCarbs = carbs.doubleValue(for: .gram())
+                    if sentCarbs > 0 {
+                        QuickPickMealsManager.shared.recordMeal(
+                            carbs: sentCarbs,
+                            fat: fat.doubleValue(for: .gram()),
+                            protein: protein.doubleValue(for: .gram()),
+                            bolus: bolusAmount.doubleValue(for: .internationalUnit())
+                        )
+                    }
+                    statusMessage = RemoteCommandMessage.sent
                     LogManager.shared.log(
                         category: .apns,
                         message: "sendMealPushNotification succeeded - Carbs: \(carbs.doubleValue(for: .gram())) g, Protein: \(protein.doubleValue(for: .gram())) g, Fat: \(fat.doubleValue(for: .gram())) g, Bolus: \(bolusAmount.doubleValue(for: .internationalUnit())) U, Scheduled: \(scheduledDate != nil ? formatDate(scheduledDate!) : "now")"
@@ -343,6 +392,21 @@ struct MealView: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+
+    private func applyQuickPickMeal(_ meal: QuickPickMeal) {
+        let maxC = maxCarbs.value.doubleValue(for: .gram())
+        carbs = HKQuantity(unit: .gram(), doubleValue: min(meal.carbs, maxC))
+        if mealWithFatProtein.value {
+            let maxF = maxFat.value.doubleValue(for: .gram())
+            let maxP = maxProtein.value.doubleValue(for: .gram())
+            fat = HKQuantity(unit: .gram(), doubleValue: min(meal.fat, maxF))
+            protein = HKQuantity(unit: .gram(), doubleValue: min(meal.protein, maxP))
+        }
+        if mealWithBolus.value, meal.bolus > 0 {
+            let maxB = maxBolus.value.doubleValue(for: .internationalUnit())
+            bolusAmount = HKQuantity(unit: .internationalUnit(), doubleValue: min(meal.bolus, maxB))
+        }
     }
 
     private func handleValidationError(_ message: String) {

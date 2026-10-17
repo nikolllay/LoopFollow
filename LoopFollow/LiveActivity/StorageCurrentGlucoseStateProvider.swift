@@ -2,6 +2,7 @@
 // StorageCurrentGlucoseStateProvider.swift
 
 import Foundation
+import HealthKit
 
 /// Reads the latest glucose state from LoopFollow's Storage and Observable layers.
 /// This is the only file in the pipeline that is allowed to touch Storage.shared
@@ -45,6 +46,18 @@ struct StorageCurrentGlucoseStateProvider: CurrentGlucoseStateProviding {
 
     var override: String? {
         Observable.shared.override.value
+    }
+
+    var overrideEndAt: TimeInterval? {
+        Observable.shared.overrideEndAt.value
+    }
+
+    var tempTargetMgdl: Double? {
+        Observable.shared.tempTarget.value?.doubleValue(for: .milligramsPerDeciliter)
+    }
+
+    var tempTargetEndAt: TimeInterval? {
+        Observable.shared.tempTargetEndAt.value
     }
 
     var recBolus: Double? {
@@ -134,9 +147,10 @@ struct StorageCurrentGlucoseStateProvider: CurrentGlucoseStateProviding {
         #if targetEnvironment(macCatalyst)
             return false
         #else
-            let renewBy = Storage.shared.laRenewBy.value
-            let now = Date().timeIntervalSince1970
-            return renewBy > 0 && now >= renewBy - LiveActivityManager.renewalWarning
+            // Push-to-start renews silently at the deadline, so only show the
+            // "tap to update" overlay once renewal has actually failed (no token,
+            // bad creds, rate-limited) — that is genuinely user-actionable.
+            return Storage.shared.laRenewalFailed.value
         #endif
     }
 }

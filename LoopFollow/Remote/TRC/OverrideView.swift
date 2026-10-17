@@ -10,6 +10,7 @@ struct OverrideView: View {
 
     @ObservedObject var device = Storage.shared.device
     @ObservedObject var overrideNote = Observable.shared.override
+    @ObservedObject var overrideEndAt = Observable.shared.overrideEndAt
 
     @State private var showAlert: Bool = false
     @State private var alertType: AlertType? = nil
@@ -48,6 +49,14 @@ struct OverrideView: View {
                                     Spacer()
                                     Text(activeNote)
                                         .foregroundColor(.secondary)
+                                }
+                                if let endAt = overrideEndAt.value {
+                                    HStack {
+                                        Text("Time Remaining")
+                                        Spacer()
+                                        RemainingTimeText(endAt: endAt)
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                                 Button {
                                     alertType = .confirmCancellation
@@ -138,7 +147,7 @@ struct OverrideView: View {
                     )
                 case .statusSuccess:
                     return Alert(
-                        title: Text("Success"),
+                        title: Text("Command Sent"),
                         message: Text(statusMessage ?? ""),
                         dismissButton: .default(Text("OK"), action: {
                             presentationMode.wrappedValue.dismiss()
@@ -172,7 +181,7 @@ struct OverrideView: View {
             DispatchQueue.main.async {
                 self.isLoading = false
                 if success {
-                    self.statusMessage = "Override command sent successfully."
+                    self.statusMessage = RemoteCommandMessage.sent
                     self.alertType = .statusSuccess
                     LogManager.shared.log(category: .apns, message: "sendOverridePushNotification succeeded for override: \(override.name)")
                 } else {
@@ -192,7 +201,7 @@ struct OverrideView: View {
             DispatchQueue.main.async {
                 self.isLoading = false
                 if success {
-                    self.statusMessage = "Cancel override command sent successfully."
+                    self.statusMessage = RemoteCommandMessage.sent
                     self.alertType = .statusSuccess
                     LogManager.shared.log(category: .apns, message: "sendCancelOverridePushNotification succeeded")
                 } else {

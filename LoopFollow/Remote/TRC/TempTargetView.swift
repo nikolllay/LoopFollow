@@ -10,6 +10,7 @@ struct TempTargetView: View {
 
     @ObservedObject var device = Storage.shared.device
     @ObservedObject var tempTarget = Observable.shared.tempTarget
+    @ObservedObject var tempTargetEndAt = Observable.shared.tempTargetEndAt
 
     @State private var newHKTarget = HKQuantity(unit: .milligramsPerDeciliter, doubleValue: 0.0)
     @State private var duration = HKQuantity(unit: .minute(), doubleValue: 0.0)
@@ -50,6 +51,14 @@ struct TempTargetView: View {
                                     Spacer()
                                     Text(Localizer.formatQuantity(tempTargetValue))
                                     Text(Localizer.getPreferredUnit().localizedShortUnitString).foregroundColor(.secondary)
+                                }
+                                if let endAt = tempTargetEndAt.value {
+                                    HStack {
+                                        Text("Time Remaining")
+                                        Spacer()
+                                        RemainingTimeText(endAt: endAt)
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                                 Button {
                                     alertType = .confirmCancellation
@@ -180,7 +189,7 @@ struct TempTargetView: View {
                     )
                 case .statusSuccess:
                     return Alert(
-                        title: Text("Status"),
+                        title: Text("Command Sent"),
                         message: Text(statusMessage ?? ""),
                         dismissButton: .default(Text("OK"), action: {
                             presentationMode.wrappedValue.dismiss()
@@ -252,7 +261,7 @@ struct TempTargetView: View {
             DispatchQueue.main.async {
                 self.isLoading = false
                 if success {
-                    self.statusMessage = "Temp target command successfully sent."
+                    self.statusMessage = RemoteCommandMessage.sent
                     self.alertType = .statusSuccess
                     LogManager.shared.log(category: .apns, message: "sendTempTargetPushNotification succeeded with target: \(newHKTarget), duration: \(duration)")
                 } else {
@@ -272,7 +281,7 @@ struct TempTargetView: View {
             DispatchQueue.main.async {
                 self.isLoading = false
                 if success {
-                    self.statusMessage = "Cancel temp target command successfully sent."
+                    self.statusMessage = RemoteCommandMessage.sent
                     self.alertType = .statusSuccess
                     LogManager.shared.log(category: .apns, message: "sendCancelTempTargetPushNotification succeeded")
                 } else {

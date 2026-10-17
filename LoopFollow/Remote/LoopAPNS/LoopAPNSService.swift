@@ -162,7 +162,7 @@ class LoopAPNSService {
 
         // Encrypt and include return notification info using OTP
         if let returnInfo = createReturnNotificationInfo() {
-            LogManager.shared.log(category: .apns, message: "Created return notification info for carbs - deviceToken: \(returnInfo.deviceToken.prefix(8))..., bundleId: \(returnInfo.bundleId)")
+            LogManager.shared.log(category: .apns, message: "Created return notification info for carbs - deviceToken: \(LogRedactor.head(returnInfo.deviceToken)), bundleId: \(LogRedactor.bundleId(returnInfo.bundleId))")
             if let encryptedReturnInfo = encryptReturnNotificationInfo(returnInfo: returnInfo, otpCode: String(payload.otp)) {
                 finalPayload["encrypted_return_notification"] = encryptedReturnInfo
                 LogManager.shared.log(category: .apns, message: "Added encrypted_return_notification to carbs payload, length: \(encryptedReturnInfo.count)")
@@ -227,7 +227,7 @@ class LoopAPNSService {
 
         // Encrypt and include return notification info using OTP
         if let returnInfo = createReturnNotificationInfo() {
-            LogManager.shared.log(category: .apns, message: "Created return notification info for carbs - deviceToken: \(returnInfo.deviceToken.prefix(8))..., bundleId: \(returnInfo.bundleId)")
+            LogManager.shared.log(category: .apns, message: "Created return notification info for carbs - deviceToken: \(LogRedactor.head(returnInfo.deviceToken)), bundleId: \(LogRedactor.bundleId(returnInfo.bundleId))")
             if let encryptedReturnInfo = encryptReturnNotificationInfo(returnInfo: returnInfo, otpCode: String(payload.otp)) {
                 finalPayload["encrypted_return_notification"] = encryptedReturnInfo
                 LogManager.shared.log(category: .apns, message: "Added encrypted_return_notification to carbs payload, length: \(encryptedReturnInfo.count)")
@@ -682,7 +682,7 @@ class LoopAPNSService {
             "alert": alertText,
         ]
 
-        if let duration = duration, duration > 0 {
+        if let duration = duration {
             payload["override-duration-minutes"] = Int(duration / 60)
         }
 

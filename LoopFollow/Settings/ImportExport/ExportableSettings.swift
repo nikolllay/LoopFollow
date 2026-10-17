@@ -11,14 +11,78 @@ struct NightscoutSettingsExport: Codable {
     let url: String
     let token: String
     let units: String
+    let glycemicMetricMode: String
+    let glycemicOutputUnit: String
+    let timeInRangeMode: String
+    let lowLine: Double?
+    let highLine: Double?
+    let variabilityMetricMode: String
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case url
+        case token
+        case units
+        case glycemicMetricMode
+        case glycemicOutputUnit
+        case timeInRangeMode
+        case lowLine
+        case highLine
+        case variabilityMetricMode
+    }
+
+    init(
+        version: String,
+        url: String,
+        token: String,
+        units: String,
+        glycemicMetricMode: String,
+        glycemicOutputUnit: String,
+        timeInRangeMode: String,
+        lowLine: Double?,
+        highLine: Double?,
+        variabilityMetricMode: String
+    ) {
+        self.version = version
+        self.url = url
+        self.token = token
+        self.units = units
+        self.glycemicMetricMode = glycemicMetricMode
+        self.glycemicOutputUnit = glycemicOutputUnit
+        self.timeInRangeMode = timeInRangeMode
+        self.lowLine = lowLine
+        self.highLine = highLine
+        self.variabilityMetricMode = variabilityMetricMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(String.self, forKey: .version)
+        url = try container.decode(String.self, forKey: .url)
+        token = try container.decode(String.self, forKey: .token)
+        units = try container.decodeIfPresent(String.self, forKey: .units) ?? GlucoseDisplayUnit.mgdL.rawValue
+        glycemicMetricMode = try container.decodeIfPresent(String.self, forKey: .glycemicMetricMode) ?? GlycemicMetricMode.gmi.rawValue
+        glycemicOutputUnit = try container.decodeIfPresent(String.self, forKey: .glycemicOutputUnit) ?? GlycemicOutputUnit.percent.rawValue
+        timeInRangeMode = try container.decodeIfPresent(String.self, forKey: .timeInRangeMode) ?? TimeInRangeDisplayMode.tir.rawValue
+        lowLine = try container.decodeIfPresent(Double.self, forKey: .lowLine)
+        highLine = try container.decodeIfPresent(Double.self, forKey: .highLine)
+        variabilityMetricMode = try container.decodeIfPresent(String.self, forKey: .variabilityMetricMode) ?? VariabilityMetricMode.stdDeviation.rawValue
+    }
 
     static func fromCurrentStorage() -> NightscoutSettingsExport {
         let storage = Storage.shared
+        let unitSettings = UnitSettingsStore.shared
         return NightscoutSettingsExport(
             version: AppVersionManager().version(),
             url: storage.url.value,
             token: storage.token.value,
-            units: storage.units.value
+            units: storage.units.value,
+            glycemicMetricMode: unitSettings.glycemicMetricMode.rawValue,
+            glycemicOutputUnit: unitSettings.glycemicOutputUnit.rawValue,
+            timeInRangeMode: unitSettings.timeInRangeMode.rawValue,
+            lowLine: storage.lowLine.value,
+            highLine: storage.highLine.value,
+            variabilityMetricMode: unitSettings.variabilityMetricMode.rawValue
         )
     }
 
@@ -27,6 +91,25 @@ struct NightscoutSettingsExport: Codable {
         storage.url.value = url
         storage.token.value = token
         storage.units.value = units
+
+        if let glycemicMetricMode = GlycemicMetricMode(rawValue: glycemicMetricMode) {
+            UnitSettingsStore.shared.glycemicMetricMode = glycemicMetricMode
+        }
+        if let glycemicOutputUnit = GlycemicOutputUnit(rawValue: glycemicOutputUnit) {
+            UnitSettingsStore.shared.glycemicOutputUnit = glycemicOutputUnit
+        }
+        if let timeInRangeMode = TimeInRangeDisplayMode(rawValue: timeInRangeMode) {
+            UnitSettingsStore.shared.timeInRangeMode = timeInRangeMode
+        }
+        if let lowLine = lowLine {
+            storage.lowLine.value = lowLine
+        }
+        if let highLine = highLine {
+            storage.highLine.value = highLine
+        }
+        if let variabilityMetricMode = VariabilityMetricMode(rawValue: variabilityMetricMode) {
+            UnitSettingsStore.shared.variabilityMetricMode = variabilityMetricMode
+        }
     }
 
     func encodeToJSON() -> String? {
@@ -211,10 +294,6 @@ struct RemoteSettingsExport: Codable {
                 storage.device.value = "Loop"
             case .trc:
                 storage.device.value = "Trio"
-            case .nightscout:
-                // For Nightscout, we don't automatically set device type
-                // as it should be determined by the actual connection
-                break
             case .none:
                 break
             }
@@ -234,8 +313,6 @@ struct RemoteSettingsExport: Codable {
         switch remoteType {
         case .none:
             return true
-        case .nightscout:
-            return !user.isEmpty
         case .trc:
             return !user.isEmpty && !sharedSecret.isEmpty && !remoteApnsKey.isEmpty && !remoteKeyId.isEmpty
         case .loopAPNS:
@@ -312,6 +389,44 @@ struct RemoteSettingsExport: Codable {
     }
 }
 
+// MARK: - APNS Settings Export
+
+struct APNSSettingsExport: Codable {
+    let version: String
+    let keyId: String
+    let apnsKey: String
+
+    static func fromCurrentStorage() -> APNSSettingsExport {
+        let storage = Storage.shared
+        return APNSSettingsExport(
+            version: AppVersionManager().version(),
+            keyId: storage.lfKeyId.value,
+            apnsKey: storage.lfApnsKey.value
+        )
+    }
+
+    func applyToStorage() {
+        let storage = Storage.shared
+        storage.lfKeyId.value = keyId
+
+        let apnsService = LoopAPNSService()
+        storage.lfApnsKey.value = apnsService.validateAndFixAPNSKey(apnsKey)
+    }
+
+    func encodeToJSON() -> String? {
+        do {
+            let data = try JSONEncoder().encode(self)
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    func hasValidSettings() -> Bool {
+        APNsCredentialValidator.isFullyConfigured(keyId: keyId, apnsKey: apnsKey)
+    }
+}
+
 // MARK: - Combined Settings Export
 
 struct CombinedSettingsExport: Codable {
@@ -321,6 +436,7 @@ struct CombinedSettingsExport: Codable {
     let dexcom: DexcomSettingsExport?
     let remote: RemoteSettingsExport?
     let alarms: AlarmSettingsExport?
+    let apns: APNSSettingsExport?
     let exportType: String
     let timestamp: Date
 
@@ -328,6 +444,7 @@ struct CombinedSettingsExport: Codable {
          dexcom: DexcomSettingsExport? = nil,
          remote: RemoteSettingsExport? = nil,
          alarms: AlarmSettingsExport? = nil,
+         apns: APNSSettingsExport? = nil,
          exportType: String)
     {
         version = "1.0"
@@ -336,6 +453,7 @@ struct CombinedSettingsExport: Codable {
         self.dexcom = dexcom
         self.remote = remote
         self.alarms = alarms
+        self.apns = apns
         self.exportType = exportType
         timestamp = Date()
     }
