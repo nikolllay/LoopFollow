@@ -18,11 +18,14 @@ struct ContentView: View {
         TabView {
             GlucoseView(model: model)
                 .overlay(alignment: .topTrailing) {
-                    VStack(spacing: 8) {
+                    // Spaced apart with larger tap areas so the two small icons are hard to mix up.
+                    VStack(spacing: 12) {
                         Button { showSettings = true } label: {
                             Image(systemName: "gear")
                                 .font(.system(size: 14, weight: .medium))
                                 .foregroundColor(.secondary)
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Settings")
@@ -32,12 +35,32 @@ struct ContentView: View {
                                 Image(systemName: "antenna.radiowaves.left.and.right")
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundColor(.secondary)
+                                    .frame(width: 28, height: 28)
+                                    .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Remote Commands")
                         }
+
+                        // Fetch the latest data now, like pull-to-refresh on the phone.
+                        Button { model.requestRefresh() } label: {
+                            Group {
+                                if model.isRefreshing {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isRefreshing)
+                        .accessibilityLabel("Refresh")
                     }
-                    .padding([.top, .trailing], 4)
                 }
                 .sheet(isPresented: $showRemote) {
                     NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot) }
@@ -46,7 +69,12 @@ struct ContentView: View {
                     NavigationStack { WatchAlertSettingsView(model: model) }
                 }
 
-            GlucoseChartView(points: model.history, unit: model.snapshot?.unit ?? .mgdl)
+            GlucoseChartView(
+                points: model.history,
+                treatments: model.treatments,
+                treatmentsAsOf: model.treatmentsAsOf,
+                unit: model.snapshot?.unit ?? .mgdl
+            )
 
             StatsPageView(stats: model.stats, unit: model.snapshot?.unit ?? .mgdl)
 
@@ -99,7 +127,10 @@ final class WatchViewModel: ObservableObject {
     @Published var hasActiveAlert = false
     @Published var remoteEnabled = LAAppGroupSettings.isWatchRemoteEnabled()
     @Published var history: [WatchGlucoseHistory.Point] = WatchGlucoseHistory.load()?.points ?? []
+    @Published var treatments: [WatchTreatmentHistory.Treatment] = WatchTreatmentHistory.load()?.treatments ?? []
+    @Published var treatmentsAsOf: TimeInterval? = WatchTreatmentHistory.load()?.asOf
     @Published var stats: WatchStatsSummary? = WatchStatsSummary.load()
+    @Published var isRefreshing = false
 
     private var timer: Timer?
     private var notificationObserver: Any?
@@ -147,6 +178,24 @@ final class WatchViewModel: ObservableObject {
         if let obs = settingsObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
+    /// The Watch's pull-to-refresh: asks the phone to fetch from Nightscout now, or polls
+    /// Nightscout directly when the phone isn't reachable.
+    func requestRefresh() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        WKInterfaceDevice.current().play(.click)
+        WatchSessionReceiver.shared.requestRefresh { [weak self] phoneIsFetching in
+            DispatchQueue.main.async {
+                self?.refresh()
+                // The phone sends what it fetched about 8 s later; keep the spinner up until then.
+                DispatchQueue.main.asyncAfter(deadline: .now() + (phoneIsFetching ? 10 : 1.5)) {
+                    self?.isRefreshing = false
+                    self?.refresh()
+                }
+            }
+        }
+    }
+
     func refresh() {
         if let loaded = GlucoseSnapshotStore.shared.load() {
             snapshot = loaded
@@ -157,6 +206,9 @@ final class WatchViewModel: ObservableObject {
         hasActiveAlert = snapshot.map { WatchAlertManager.shared.hasActiveAlert(for: $0) } ?? false
         remoteEnabled = LAAppGroupSettings.isWatchRemoteEnabled()
         history = WatchGlucoseHistory.load()?.points ?? []
+        let treatmentHistory = WatchTreatmentHistory.load()
+        treatments = treatmentHistory?.treatments ?? []
+        treatmentsAsOf = treatmentHistory?.asOf
         stats = WatchStatsSummary.load()
     }
 
@@ -165,6 +217,9 @@ final class WatchViewModel: ObservableObject {
         selectedSlots = LAAppGroupSettings.watchSelectedSlots()
         hasActiveAlert = WatchAlertManager.shared.hasActiveAlert(for: snapshot)
         history = WatchGlucoseHistory.load()?.points ?? []
+        let treatmentHistory = WatchTreatmentHistory.load()
+        treatments = treatmentHistory?.treatments ?? []
+        treatmentsAsOf = treatmentHistory?.asOf
         stats = WatchStatsSummary.load()
     }
 
@@ -268,6 +323,8 @@ struct GlucoseView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                // Fill the page so the icon column sits in the corner, not over the placeholder.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .sheet(isPresented: $model.showSnoozeSheet, onDismiss: { model.refresh() }) {

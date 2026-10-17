@@ -3,6 +3,7 @@
 
 import Combine
 import Foundation
+import UIKit
 import WatchConnectivity
 
 final class WatchConnectivityManager: NSObject {
@@ -19,6 +20,14 @@ final class WatchConnectivityManager: NSObject {
     private var lastComplicationPushTime: Date = .distantPast
     /// Timestamp of the last remote command received from the Watch.
     private var lastWatchCommandDate: Date = .distantPast
+    /// When the Watch last asked for a refresh; requests closer together than
+    /// `watchRefreshInterval` reuse the fetch already under way.
+    private var lastWatchRefresh: Date = .distantPast
+    private static let watchRefreshInterval: TimeInterval = 15
+    /// BG, device status and treatments land within a few seconds of a refresh.
+    private static let refreshPushDelay: TimeInterval = 8
+    /// Background time held from a Watch refresh until its result has been sent.
+    private var refreshBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// Settings most recently handed to WatchConnectivity, used to skip redundant pushes.
     private var lastSentSettings: WatchSettings?
     private var cancellables = Set<AnyCancellable>()
@@ -87,6 +96,9 @@ final class WatchConnectivityManager: NSObject {
         if !readings.isEmpty, let data = try? WatchGlucoseHistory.make(from: readings, now: now).encoded() {
             payload[WatchGlucoseHistory.payloadKey] = data
         }
+        if let treatments = currentTreatmentHistory(now: now), let data = try? treatments.encoded() {
+            payload[WatchTreatmentHistory.payloadKey] = data
+        }
         if let stats = WatchStatsSummary.make(
             from: readings,
             lowMgdl: settings.lowMgdl,
@@ -103,6 +115,94 @@ final class WatchConnectivityManager: NSObject {
     private func currentReadings() -> [WatchGlucoseHistory.Point] {
         guard Thread.isMainThread, let readings = MainViewController.shared?.bgData else { return [] }
         return readings.map { WatchGlucoseHistory.Point(date: $0.date, mgdl: $0.sgv) }
+    }
+
+    /// Boluses, SMBs and carbs for the Watch graph, filtered and labelled like the iPhone
+    /// graph. Nil off main, where the treatment arrays can't be read, and before the first
+    /// treatment download, so the Watch keeps what it has instead of clearing it.
+    private func currentTreatmentHistory(now: Date) -> WatchTreatmentHistory? {
+        guard Thread.isMainThread, let vc = MainViewController.shared else { return nil }
+        if IsNightscoutEnabled(), Storage.shared.downloadTreatments.value, vc.treatmentsUpdatedAt == nil {
+            return nil
+        }
+        // Only the Watch's window needs labels; the arrays can hold days of treatments.
+        let nowSeconds = now.timeIntervalSince1970
+        let inWindow: (TimeInterval) -> Bool = { WatchTreatmentHistory.isInWindow($0, now: nowSeconds) }
+        let showValues = Storage.shared.showValues.value
+        var treatments: [WatchTreatmentHistory.Treatment] = []
+        if Storage.shared.graphBolus.value {
+            treatments += vc.bolusData.filter { inWindow($0.date) }.map {
+                WatchTreatmentHistory.Treatment(kind: .bolus, date: $0.date, mgdl: $0.sgv, label: showValues ? WatchTreatmentHistory.doseLabel($0.value) : "")
+            }
+            treatments += vc.smbData.filter { inWindow($0.date) }.map {
+                WatchTreatmentHistory.Treatment(kind: .smb, date: $0.date, mgdl: $0.sgv, label: showValues ? WatchTreatmentHistory.doseLabel($0.value) : "")
+            }
+        }
+        if Storage.shared.graphCarbs.value {
+            let showAbsorption = Storage.shared.showAbsorption.value
+            treatments += vc.carbData.filter { inWindow($0.date) }.map {
+                let label = WatchTreatmentHistory.carbLabel(grams: Int($0.value), absorptionMinutes: $0.absorptionTime, showAbsorption: showAbsorption)
+                return WatchTreatmentHistory.Treatment(kind: .carbs, date: $0.date, mgdl: $0.sgv, label: showValues ? label : "")
+            }
+        }
+        return WatchTreatmentHistory.make(from: treatments, asOf: vc.treatmentsUpdatedAt?.timeIntervalSince1970, now: now)
+    }
+
+    // MARK: - Refresh
+
+    /// The Watch's pull-to-refresh: re-runs every Nightscout fetch now, as pulling down on the
+    /// phone's home screen does, and sends the result a few seconds later. Returns false when
+    /// the phone can't fetch (locked since a restart, or no data pipeline yet), so the Watch can
+    /// poll Nightscout itself. Call on the main thread.
+    private func refreshForWatch() -> Bool {
+        // Before the first unlock after a reboot, settings can't be read yet; don't fetch with defaults.
+        guard StorageReadiness.ready.value, let vc = MainViewController.shared else { return false }
+        let now = Date()
+        // Requests closer together than this reuse the fetch already under way.
+        guard now.timeIntervalSince(lastWatchRefresh) >= Self.watchRefreshInterval else { return true }
+        if UIApplication.shared.applicationState == .background {
+            // A message from the Watch only wakes the app briefly; hold background time until the
+            // result has gone out. Without it iOS may suspend the app first, and the Watch should
+            // poll Nightscout itself instead.
+            endRefreshBackgroundTask()
+            refreshBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "WatchRefresh") { [weak self] in
+                self?.endRefreshBackgroundTask()
+            }
+            guard refreshBackgroundTask != .invalid else { return false }
+            // The Nightscout WebSocket is foreground-only (it closes when the app goes to the
+            // background) and refresh() would reopen it, so only re-run the fetches.
+            vc.scheduleAllTasks()
+        } else {
+            vc.refresh()
+        }
+        lastWatchRefresh = now
+        LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch asked for a refresh")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.refreshPushDelay) { [weak self] in
+            self?.pushCurrentState()
+            self?.endRefreshBackgroundTask()
+        }
+        return true
+    }
+
+    private func endRefreshBackgroundTask() {
+        guard refreshBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(refreshBackgroundTask)
+        refreshBackgroundTask = .invalid
+    }
+
+    /// Sends the phone's current state to a reachable Watch right away, without waiting for
+    /// the next Live Activity refresh. Call on the main thread.
+    private func pushCurrentState() {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+        session.sendMessage(makePayload(snapshot: currentSnapshot()), replyHandler: nil, errorHandler: nil)
+        LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: refreshed state sent to Watch")
+    }
+
+    /// The phone's current values as a snapshot, or the last stored one when they're incomplete.
+    private func currentSnapshot() -> GlucoseSnapshot? {
+        GlucoseSnapshotBuilder.build(from: StorageCurrentGlucoseStateProvider()) ?? GlucoseSnapshotStore.shared.load()
     }
 
     // MARK: - Send Settings
@@ -243,6 +343,16 @@ extension WatchConnectivityManager: WCSessionDelegate {
         didReceiveMessage message: [String: Any],
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
+        if message["watchRequestRefresh"] != nil {
+            DispatchQueue.main.async {
+                let fetching = self.refreshForWatch()
+                // Answer with what the phone has now; what it fetches follows a few seconds later.
+                var reply = self.makePayload(snapshot: self.currentSnapshot())
+                reply["refreshing"] = fetching
+                replyHandler(reply)
+            }
+            return
+        }
         if message["watchRequestSettings"] != nil {
             DispatchQueue.main.async {
                 replyHandler(self.makePayload(snapshot: GlucoseSnapshotStore.shared.load()))

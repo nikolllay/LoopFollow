@@ -77,6 +77,8 @@ class MainViewController: UIViewController, UNUserNotificationCenterDelegate {
     var bolusData: [bolusGraphStruct] = []
     var smbData: [bolusGraphStruct] = []
     var carbData: [carbGraphStruct] = []
+    /// When treatments were last downloaded and processed; nil until the first download.
+    var treatmentsUpdatedAt: Date?
 
     // Stats-specific data storage (can hold up to 30 days)
     var statsBGData: [ShareGlucoseData] = []

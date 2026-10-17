@@ -111,7 +111,8 @@ final class WatchNightscoutFetcher: NSObject {
                 return
             }
 
-            let updatedAt = Date(timeIntervalSince1970: entry.date / 1000)
+            // Rounded like the phone (BGData), so a reading the phone already delivered counts as the same one.
+            let updatedAt = Date(timeIntervalSince1970: (entry.date / 1000).rounded(.toNearestOrEven))
             let unit = resolveUnit()
             let history = WatchGlucoseHistory.load() ?? WatchGlucoseHistory(points: [])
             // Delta against the previous reading, if it is roughly one CGM interval back.

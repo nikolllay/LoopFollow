@@ -223,5 +223,7 @@ extension MainViewController {
         if Storage.shared.device.value == "Loop" {
             updateLoopTDD()
         }
+
+        treatmentsUpdatedAt = Date()
     }
 }
