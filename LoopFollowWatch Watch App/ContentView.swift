@@ -213,6 +213,12 @@ struct GlucoseView: View {
                             .font(.system(size: 14))
                             .foregroundColor(.white)
 
+                        if s.iob != nil {
+                            Text("IOB: \(WatchFormat.iob(s)) U")
+                                .font(.system(size: 14))
+                                .foregroundColor(.white)
+                        }
+
                         if s.projected != nil {
                             Text("Projected: \(WatchFormat.projected(s)) \(s.unit.displayName)")
                                 .font(.system(size: 14))
