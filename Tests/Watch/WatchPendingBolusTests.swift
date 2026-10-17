@@ -42,6 +42,25 @@ struct WatchPendingBolusTests {
         #expect(shown == 0)
     }
 
+    @Test("#two Watch boluses the loop hasn't seen are both subtracted")
+    func subtractsEveryPendingBolus() {
+        let second = WatchPendingBolus(units: 1.0, sentAt: sentAt.addingTimeInterval(120))
+        let shown = WatchPendingBolus.adjustedRecommendation(
+            3.0, pending: [pending, second], loopRanAt: sentAt.addingTimeInterval(-60), now: sentAt.addingTimeInterval(180)
+        )
+        #expect(shown == 0.5)
+    }
+
+    @Test("#a bolus the loop has already seen is not subtracted again")
+    func subtractsOnlyUnseen() {
+        let later = WatchPendingBolus(units: 1.0, sentAt: sentAt.addingTimeInterval(10 * 60))
+        // The loop ran 5 minutes after the first bolus, before the second.
+        let shown = WatchPendingBolus.adjustedRecommendation(
+            2.0, pending: [pending, later], loopRanAt: sentAt.addingTimeInterval(5 * 60), now: sentAt.addingTimeInterval(11 * 60)
+        )
+        #expect(shown == 1.0)
+    }
+
     @Test("#no pending bolus leaves the recommendation unchanged")
     func noPending() {
         #expect(WatchPendingBolus.adjustedRecommendation(1.2, pending: nil, loopRanAt: nil, now: sentAt) == 1.2)

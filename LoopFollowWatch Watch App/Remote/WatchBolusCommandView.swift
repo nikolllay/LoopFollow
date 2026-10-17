@@ -15,6 +15,7 @@ struct WatchBolusCommandView: View {
     @State private var isSending = false
     @State private var alertMessage = ""
     @State private var showAlert = false
+    @FocusState private var amountFocused: Bool
 
     private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
     private let step: Double
@@ -29,13 +30,17 @@ struct WatchBolusCommandView: View {
         guard let rec = snapshot.recBolus else { return nil }
         return WatchPendingBolus.adjustedRecommendation(
             rec,
-            pending: WatchPendingBolus.load(),
+            pending: WatchPendingBolus.loadAll(),
             loopRanAt: snapshot.loopLastRunAt.map { Date(timeIntervalSince1970: $0) },
             now: Date()
         )
     }
 
-    private var recBolusAge: Int? {
+    private var recBolusAge: Int? { Self.recommendationAge(of: snapshot) }
+
+    /// Minutes since the loop computed the recommendation; nil once it is 12 minutes old,
+    /// when it is no longer offered at all.
+    private static func recommendationAge(of snapshot: GlucoseSnapshot?) -> Int? {
         guard let t = snapshot?.loopLastRunAt else { return nil }
         let mins = Int(Date().timeIntervalSince1970 - t) / 60
         return mins < 12 ? mins : nil
@@ -47,7 +52,10 @@ struct WatchBolusCommandView: View {
         let step = Self.step(for: system)
         self.step = step
         let maxB = Self.maxBolus(step: step, system: system)
-        let rec = snapshot.flatMap { Self.adjustedRecommendation(for: $0) } ?? 0
+        // Only a fresh recommendation fills the amount in; an older one must be picked from its
+        // row, which shows its age.
+        let isFresh = (Self.recommendationAge(of: snapshot) ?? .max) < 5
+        let rec = isFresh ? snapshot.flatMap { Self.adjustedRecommendation(for: $0) } ?? 0 : 0
         _bolusUnits = State(initialValue: rec > 0 ? Self.prefill(rec, maxBolus: maxB, step: step, system: system) : step)
     }
 
@@ -102,6 +110,18 @@ struct WatchBolusCommandView: View {
                 VStack(spacing: 4) {
                     Text("\(formatted(bolusUnits))U")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
+                        // The crown adjusts the amount in the same steps as the buttons.
+                        .focusable()
+                        .focused($amountFocused)
+                        .digitalCrownRotation(
+                            $bolusUnits,
+                            from: step,
+                            through: maxBolus,
+                            by: step,
+                            sensitivity: .low,
+                            isContinuous: false,
+                            isHapticFeedbackEnabled: true
+                        )
 
                     HStack(spacing: 16) {
                         Button {
@@ -126,6 +146,8 @@ struct WatchBolusCommandView: View {
 
                 // Send button
                 Button {
+                    // Release the crown so turning it to confirm can't change the amount.
+                    amountFocused = false
                     showConfirm = true
                 } label: {
                     Text("Send Bolus")
@@ -135,11 +157,13 @@ struct WatchBolusCommandView: View {
                 .tint(.red)
                 .disabled(isSending || bolusUnits <= 0)
                 .sheet(isPresented: $showConfirm) {
+                    // The amount confirmed here is the amount sent.
+                    let units = bolusUnits
                     CrownConfirmView(
-                        title: "Send \(formatted(bolusUnits))U?",
+                        title: "Send \(formatted(units))U?",
                         detail: "Turn the crown to confirm"
                     ) {
-                        authenticateAndSend()
+                        authenticateAndSend(units: units)
                     }
                 }
 
@@ -152,14 +176,20 @@ struct WatchBolusCommandView: View {
         }
         .navigationTitle("Bolus")
         .onAppear {
+            amountFocused = true
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        .onChange(of: bolusUnits) { _, units in
+            // Crown values carry floating-point noise; for Trio they must land exactly on the increment.
+            let cleaned = remoteSystem == .trio ? units.snapped(toStep: step) : units.rounded(toPlaces: 3)
+            if cleaned != units { bolusUnits = cleaned }
         }
         .alert(alertMessage, isPresented: $showAlert) {
             Button("OK", role: .cancel) {}
         }
     }
 
-    private func authenticateAndSend() {
+    private func authenticateAndSend(units: Double) {
         let context = LAContext()
         var authError: NSError?
         // Fail closed: without a passcode there is no way to confirm who is sending insulin.
@@ -170,10 +200,10 @@ struct WatchBolusCommandView: View {
         }
         context.evaluatePolicy(
             .deviceOwnerAuthentication,
-            localizedReason: "Confirm identity to send \(formatted(bolusUnits))U insulin"
+            localizedReason: "Confirm identity to send \(formatted(units))U insulin"
         ) { success, _ in
             DispatchQueue.main.async {
-                if success { sendBolus() } else {
+                if success { sendBolus(units: units) } else {
                     alertMessage = "Authentication failed or cancelled"
                     showAlert = true
                 }
@@ -181,14 +211,13 @@ struct WatchBolusCommandView: View {
         }
     }
 
-    private func sendBolus() {
+    private func sendBolus(units: Double) {
         guard WCSession.default.isReachable else {
             alertMessage = "Phone not reachable. Bring your iPhone closer."
             showAlert = true
             return
         }
         isSending = true
-        let units = bolusUnits
         let payload: [String: Any] = ["watchCmd": "bolus", "bolusAmount": units]
         WCSession.default.sendMessage(payload) { reply in
             DispatchQueue.main.async {
@@ -199,9 +228,20 @@ struct WatchBolusCommandView: View {
                     alertMessage = "OTP code already used. Wait up to 30 seconds and try again."
                     showAlert = true
                 } else if ok {
-                    WatchPendingBolus(units: units, sentAt: Date()).save()
+                    WatchPendingBolus(units: units, sentAt: Date()).record()
                     scheduleSuccessNotification(units: units)
                     alertMessage = "Bolus sent! (\(formatted(units))U)"
+                    showAlert = true
+                } else if reply["alreadySent"] as? Bool == true {
+                    // The phone refused a repeat of a bolus that may already have gone out.
+                    WatchPendingBolus(units: units, sentAt: Date()).recordUnlessPending()
+                    alertMessage = reply["error"] as? String ?? "Failed to send bolus"
+                    showAlert = true
+                } else if reply["maybeSent"] as? Bool == true {
+                    // The connection failed after the phone sent it; Trio may have it.
+                    WatchPendingBolus(units: units, sentAt: Date()).record()
+                    let error = reply["error"] as? String ?? "Send failed"
+                    alertMessage = "\(error)\n\nThe bolus may still have been sent. Check \(remoteSystem.displayName) before trying again."
                     showAlert = true
                 } else {
                     alertMessage = reply["error"] as? String ?? "Failed to send bolus"
@@ -211,7 +251,10 @@ struct WatchBolusCommandView: View {
         } errorHandler: { error in
             DispatchQueue.main.async {
                 isSending = false
-                alertMessage = "Send error: \(error.localizedDescription)"
+                // The phone may have sent the bolus before the reply was lost. Count it as given
+                // until the loop reports, so the recommendation doesn't invite a second full dose.
+                WatchPendingBolus(units: units, sentAt: Date()).record()
+                alertMessage = "Send error: \(error.localizedDescription)\n\nThe bolus may still have been sent. Check \(remoteSystem.displayName) before trying again."
                 showAlert = true
             }
         }
@@ -236,6 +279,11 @@ private extension Double {
     func rounded(toPlaces places: Int) -> Double {
         let divisor = pow(10.0, Double(places))
         return (self * divisor).rounded() / divisor
+    }
+
+    func snapped(toStep step: Double) -> Double {
+        guard step > 0 else { return self }
+        return ((self / step).rounded() * step).rounded(toPlaces: 3)
     }
 
     func roundedDown(toStep step: Double) -> Double {

@@ -9,6 +9,18 @@ final class WatchCommandDispatcher {
 
     private let apnsService = LoopAPNSService()
 
+    /// The last Trio bolus and carb amounts requested from the Watch, each stored as
+    /// [amount, sent at]. After a lost reply or a network error nobody can tell whether a
+    /// command went out, so the same amount again within `repeatWindow` is refused.
+    /// Persisted, so a relaunch of the app doesn't forget it.
+    private enum RepeatGuard: String {
+        case bolus = "watchRecentTrioBolus"
+        case carbs = "watchRecentTrioCarbs"
+    }
+
+    private let repeatGuardLock = NSLock()
+    static let repeatWindow: TimeInterval = 3 * 60
+
     private init() {}
 
     /// The remote Watch commands go through: Trio when Trio Remote Control is the
@@ -197,6 +209,16 @@ final class WatchCommandDispatcher {
             return
         }
 
+        guard claim(.carbs, amount: carbsAmount) else {
+            LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio carbs refused — same amount requested within \(Int(Self.repeatWindow))s")
+            replyHandler([
+                "success": false,
+                "alreadySent": true,
+                "error": "\(Int(carbsAmount))g of carbs were requested from the Watch moments ago and may have reached Trio. Check Trio; the same amount can be sent again after \(Int(Self.repeatWindow / 60)) minutes.",
+            ])
+            return
+        }
+
         // Trio applies its own absorption, so the Watch's absorption choice is not sent.
         PushNotificationManager().sendMealPushNotification(
             carbs: HKQuantity(unit: .gram(), doubleValue: carbsAmount),
@@ -210,7 +232,7 @@ final class WatchCommandDispatcher {
             } else {
                 LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio carbs failed — \(err ?? "unknown")")
             }
-            replyHandler(["success": ok, "error": err ?? ""])
+            replyHandler(["success": ok, "error": err ?? "", "maybeSent": !ok && Self.mayHaveBeenDelivered(err)])
         }
     }
 
@@ -234,16 +256,55 @@ final class WatchCommandDispatcher {
             return
         }
 
+        guard claim(.bolus, amount: bolusAmount) else {
+            LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio bolus refused — same amount requested within \(Int(Self.repeatWindow))s")
+            replyHandler([
+                "success": false,
+                "alreadySent": true,
+                "error": "A \(String(format: "%g", bolusAmount))U bolus was requested from the Watch moments ago and may have reached Trio. Check Trio; the same amount can be sent again after \(Int(Self.repeatWindow / 60)) minutes.",
+            ])
+            return
+        }
+
         PushNotificationManager().sendBolusPushNotification(
             bolusAmount: HKQuantity(unit: .internationalUnit(), doubleValue: bolusAmount)
         ) { ok, err in
+            // The record stays even on failure: a network error can follow a push that went out.
             if ok {
                 LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio bolus sent — \(bolusAmount)U")
             } else {
                 LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio bolus failed — \(err ?? "unknown")")
             }
-            replyHandler(["success": ok, "error": err ?? ""])
+            replyHandler(["success": ok, "error": err ?? "", "maybeSent": !ok && Self.mayHaveBeenDelivered(err)])
         }
+    }
+
+    /// Records a Trio command about to be sent; false when it repeats one requested within `repeatWindow`.
+    /// The record stays even if the send fails: a network error can follow a push that went out.
+    private func claim(_ kind: RepeatGuard, amount: Double, now: Date = Date()) -> Bool {
+        repeatGuardLock.lock()
+        defer { repeatGuardLock.unlock() }
+        if let stored = UserDefaults.standard.array(forKey: kind.rawValue) as? [Double], stored.count == 2,
+           Self.isRepeat(units: amount, of: (units: stored[0], sentAt: Date(timeIntervalSince1970: stored[1])), now: now)
+        {
+            return false
+        }
+        UserDefaults.standard.set([amount, now.timeIntervalSince1970], forKey: kind.rawValue)
+        return true
+    }
+
+    /// Whether a failed push may still have reached APNs. Only a transport failure after the
+    /// request left the phone (connection lost, timed out) leaves that open; these are the
+    /// messages PushNotificationManager reports for it. Every other failure happens before
+    /// sending or is a definite answer from APNs.
+    static func mayHaveBeenDelivered(_ error: String?) -> Bool {
+        guard let error else { return false }
+        return error.hasPrefix("Failed to send push notification:") || error == "Failed to get a valid HTTP response."
+    }
+
+    /// Whether `units` repeats `recent` closely enough to be treated as an accidental resend.
+    static func isRepeat(units: Double, of recent: (units: Double, sentAt: Date), now: Date) -> Bool {
+        abs(units - recent.units) < 1e-6 && now.timeIntervalSince(recent.sentAt) < repeatWindow
     }
 
     static func isMultiple(_ value: Double, of step: Double) -> Bool {
