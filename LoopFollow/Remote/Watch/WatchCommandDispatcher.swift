@@ -11,12 +11,35 @@ final class WatchCommandDispatcher {
 
     private init() {}
 
+    /// The remote Watch commands go through: Trio when Trio Remote Control is the
+    /// selected remote type, Loop APNS otherwise. Nil when that remote isn't set up.
+    static func activeRemoteSystem() -> WatchRemoteSystem? {
+        if Storage.shared.remoteType.value == .trc {
+            return isTrioConfigured() ? .trio : nil
+        }
+        return LoopAPNSService().validateSetup() ? .loop : nil
+    }
+
+    /// Mirrors what the phone's Trio remote screen needs: a Trio device plus the
+    /// Trio-side fields of the remote settings. APNs credentials are validated on send.
+    private static func isTrioConfigured() -> Bool {
+        Storage.shared.device.value == "Trio"
+            && !Storage.shared.sharedSecret.value.isEmpty
+            && !Storage.shared.deviceToken.value.isEmpty
+            && !Storage.shared.user.value.isEmpty
+            && !Storage.shared.bundleId.value.isEmpty
+    }
+
     func handle(message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         guard let cmd = message["watchCmd"] as? String else {
             replyHandler(["success": false, "error": "Unknown command"])
             return
         }
         LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: handling command '\(cmd)'")
+        if Storage.shared.remoteType.value == .trc {
+            handleTrio(cmd: cmd, message: message, replyHandler: replyHandler)
+            return
+        }
         switch cmd {
         case "carbs":
             handleCarbs(message: message, replyHandler: replyHandler)
@@ -142,6 +165,91 @@ final class WatchCommandDispatcher {
             }
             replyHandler(["success": ok, "error": err ?? ""])
         }
+    }
+
+    // MARK: - Trio
+
+    private func handleTrio(cmd: String, message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        guard Self.isTrioConfigured() else {
+            replyHandler(["success": false, "error": "Trio Remote Control not configured"])
+            return
+        }
+        switch cmd {
+        case "carbs":
+            handleTrioCarbs(message: message, replyHandler: replyHandler)
+        case "bolus":
+            handleTrioBolus(message: message, replyHandler: replyHandler)
+        default:
+            replyHandler(["success": false, "error": "'\(cmd)' is not available for Trio from the Watch"])
+        }
+    }
+
+    private func handleTrioCarbs(message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        let carbsAmount = message["carbsAmount"] as? Double ?? 0
+        guard carbsAmount > 0 else {
+            replyHandler(["success": false, "error": "Carbs amount must be greater than 0"])
+            return
+        }
+
+        let maxCarbs = Storage.shared.maxCarbs.value.doubleValue(for: .gram())
+        guard carbsAmount <= maxCarbs else {
+            replyHandler(["success": false, "error": "Carbs exceed maximum (\(Int(maxCarbs))g)"])
+            return
+        }
+
+        // Trio applies its own absorption, so the Watch's absorption choice is not sent.
+        PushNotificationManager().sendMealPushNotification(
+            carbs: HKQuantity(unit: .gram(), doubleValue: carbsAmount),
+            protein: HKQuantity(unit: .gram(), doubleValue: 0),
+            fat: HKQuantity(unit: .gram(), doubleValue: 0),
+            bolusAmount: HKQuantity(unit: .internationalUnit(), doubleValue: 0),
+            scheduledTime: nil
+        ) { ok, err in
+            if ok {
+                LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio carbs sent — \(carbsAmount)g")
+            } else {
+                LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio carbs failed — \(err ?? "unknown")")
+            }
+            replyHandler(["success": ok, "error": err ?? ""])
+        }
+    }
+
+    private func handleTrioBolus(message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        let bolusAmount = message["bolusAmount"] as? Double ?? 0
+        guard bolusAmount > 0 else {
+            replyHandler(["success": false, "error": "Bolus amount must be greater than 0"])
+            return
+        }
+
+        let maxBolus = Storage.shared.maxBolus.value.doubleValue(for: .internationalUnit())
+        guard bolusAmount <= maxBolus else {
+            replyHandler(["success": false, "error": "Bolus exceeds maximum (\(String(format: "%.2f", maxBolus))U)"])
+            return
+        }
+
+        // Reject rather than round: the amount sent must be the one confirmed on the Watch.
+        let increment = Storage.shared.bolusIncrement.value.doubleValue(for: .internationalUnit())
+        guard Self.isMultiple(bolusAmount, of: increment) else {
+            replyHandler(["success": false, "error": "Bolus must be a multiple of \(String(format: "%g", increment))U"])
+            return
+        }
+
+        PushNotificationManager().sendBolusPushNotification(
+            bolusAmount: HKQuantity(unit: .internationalUnit(), doubleValue: bolusAmount)
+        ) { ok, err in
+            if ok {
+                LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio bolus sent — \(bolusAmount)U")
+            } else {
+                LogManager.shared.log(category: .apns, message: "WatchCommandDispatcher: Trio bolus failed — \(err ?? "unknown")")
+            }
+            replyHandler(["success": ok, "error": err ?? ""])
+        }
+    }
+
+    static func isMultiple(_ value: Double, of step: Double) -> Bool {
+        guard step > 0 else { return true }
+        let steps = value / step
+        return abs(steps - steps.rounded()) < 1e-6
     }
 
     // MARK: - TOTP Helpers

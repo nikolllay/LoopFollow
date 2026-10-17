@@ -14,10 +14,13 @@ struct WatchRemoteCommandsView: View {
                 Label("Meal", systemImage: "fork.knife")
             }
 
-            NavigationLink {
-                WatchOverridePickerView()
-            } label: {
-                Label("Presets", systemImage: "list.bullet")
+            // Override presets are only wired up for Loop.
+            if LAAppGroupSettings.watchRemoteSystem() == .loop {
+                NavigationLink {
+                    WatchOverridePickerView()
+                } label: {
+                    Label("Presets", systemImage: "list.bullet")
+                }
             }
 
             NavigationLink {

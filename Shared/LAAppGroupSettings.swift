@@ -156,6 +156,20 @@ struct WatchOverridePreset: Codable, Equatable, Identifiable {
     var durationSeconds: TimeInterval // 0 = indefinite
 }
 
+/// The phone-side remote that Watch commands are sent through.
+enum WatchRemoteSystem: String, Codable {
+    case loop
+    case trio
+
+    /// Name shown in Watch confirmations.
+    var displayName: String {
+        switch self {
+        case .loop: "Loop"
+        case .trio: "Trio"
+        }
+    }
+}
+
 // MARK: - App Group settings
 
 /// Minimal App Group settings needed by the Live Activity UI.
@@ -176,6 +190,8 @@ enum LAAppGroupSettings {
         static let watchRemoteEnabled = "watch.remoteEnabled"
         static let watchMaxBolus = "watch.maxBolus"
         static let watchMaxCarbs = "watch.maxCarbs"
+        static let watchRemoteSystem = "watch.remoteSystem"
+        static let watchBolusIncrement = "watch.bolusIncrement"
         static let watchNightscoutURL = "watch.nightscoutURL"
         static let watchNightscoutToken = "watch.nightscoutToken"
     }
@@ -323,6 +339,23 @@ enum LAAppGroupSettings {
 
     static func watchMaxCarbs() -> Double {
         defaults?.object(forKey: Keys.watchMaxCarbs) as? Double ?? 150.0
+    }
+
+    static func setWatchRemoteSystem(_ system: WatchRemoteSystem) {
+        defaults?.set(system.rawValue, forKey: Keys.watchRemoteSystem)
+    }
+
+    static func watchRemoteSystem() -> WatchRemoteSystem {
+        defaults?.string(forKey: Keys.watchRemoteSystem).flatMap(WatchRemoteSystem.init(rawValue:)) ?? .loop
+    }
+
+    static func setWatchBolusIncrement(_ increment: Double) {
+        defaults?.set(increment, forKey: Keys.watchBolusIncrement)
+    }
+
+    /// The pump's bolus increment in units, as last synced from the phone.
+    static func watchBolusIncrement() -> Double {
+        defaults?.object(forKey: Keys.watchBolusIncrement) as? Double ?? 0.05
     }
 
     // MARK: - NightScout URL and Token (Watch URLSession channel)

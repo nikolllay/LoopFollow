@@ -62,6 +62,8 @@ struct ContentView: View {
             // Shortcut complications land on their remote screen; without remote
             // commands configured they simply open the app.
             guard let link = WatchDeepLink(url: url), LAAppGroupSettings.isWatchRemoteEnabled() else { return }
+            // Override presets are only wired up for Loop.
+            if link == .override, LAAppGroupSettings.watchRemoteSystem() != .loop { return }
             showRemote = false
             showSettings = false
             deepLink = link

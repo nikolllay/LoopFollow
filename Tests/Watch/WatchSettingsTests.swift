@@ -17,7 +17,9 @@ struct WatchSettingsTests {
             WatchOverridePreset(name: "Sick", symbol: nil, durationSeconds: 0),
         ],
         nightscoutURL: "https://example.nightscout.test",
-        nightscoutToken: "token-123"
+        nightscoutToken: "token-123",
+        remoteSystem: .trio,
+        bolusIncrement: 0.025
     )
 
     @Test("#settings survive the WatchConnectivity encoding")

@@ -19,6 +19,7 @@ struct WatchMealCommandView: View {
     @State private var alertIsSuccess = false
 
     private var maxCarbs: Int { max(5, Int(LAAppGroupSettings.watchMaxCarbs())) }
+    private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
 
     var body: some View {
         ScrollView {
@@ -45,28 +46,31 @@ struct WatchMealCommandView: View {
                     }
                 }
 
-                Divider()
+                // Trio applies its own absorption, so the selector only applies to Loop.
+                if remoteSystem == .loop {
+                    Divider()
 
-                // Food type selector
-                HStack(spacing: 8) {
-                    ForEach(0 ..< foodPresets.count, id: \.self) { idx in
-                        let (emoji, _) = foodPresets[idx]
-                        Button {
-                            selectedFood = idx
-                        } label: {
-                            Text(emoji)
-                                .font(.title3)
-                                .frame(width: 44, height: 44)
-                                .background(selectedFood == idx ? Color.blue.opacity(0.3) : Color.secondary.opacity(0.15))
-                                .cornerRadius(10)
+                    // Food type selector
+                    HStack(spacing: 8) {
+                        ForEach(0 ..< foodPresets.count, id: \.self) { idx in
+                            let (emoji, _) = foodPresets[idx]
+                            Button {
+                                selectedFood = idx
+                            } label: {
+                                Text(emoji)
+                                    .font(.title3)
+                                    .frame(width: 44, height: 44)
+                                    .background(selectedFood == idx ? Color.blue.opacity(0.3) : Color.secondary.opacity(0.15))
+                                    .cornerRadius(10)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
-                }
 
-                Text("\(Int(foodPresets[selectedFood].1 * 60)) min absorption")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                    Text("\(Int(foodPresets[selectedFood].1 * 60)) min absorption")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
 
                 // Send button
                 Button {
@@ -138,7 +142,7 @@ struct WatchMealCommandView: View {
         WKInterfaceDevice.current().play(.success)
         let content = UNMutableNotificationContent()
         content.title = "Carbs Logged ✓"
-        content.body = "\(grams)g sent to Loop"
+        content.body = "\(grams)g sent to \(remoteSystem.displayName)"
         content.sound = .default
         let request = UNNotificationRequest(
             identifier: "carbs-\(UUID().uuidString)",

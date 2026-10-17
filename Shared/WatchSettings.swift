@@ -21,6 +21,10 @@ struct WatchSettings: Codable, Equatable {
     var overridePresets: [WatchOverridePreset]
     var nightscoutURL: String
     var nightscoutToken: String
+    /// Which remote the phone sends Watch commands through.
+    var remoteSystem: WatchRemoteSystem = .loop
+    /// The pump's bolus increment in units; Trio boluses must be a multiple of it.
+    var bolusIncrement: Double = 0.05
 
     func encoded() throws -> Data {
         try JSONEncoder().encode(self)
@@ -39,6 +43,8 @@ struct WatchSettings: Codable, Equatable {
         LAAppGroupSettings.setWatchOverridePresets(overridePresets)
         LAAppGroupSettings.setWatchNightscoutURL(nightscoutURL)
         LAAppGroupSettings.setWatchNightscoutToken(nightscoutToken)
+        LAAppGroupSettings.setWatchRemoteSystem(remoteSystem)
+        LAAppGroupSettings.setWatchBolusIncrement(bolusIncrement)
     }
 
     /// Reads the values back from this device's App Group container.
@@ -52,7 +58,9 @@ struct WatchSettings: Codable, Equatable {
             maxCarbs: LAAppGroupSettings.watchMaxCarbs(),
             overridePresets: LAAppGroupSettings.watchOverridePresets(),
             nightscoutURL: LAAppGroupSettings.watchNightscoutURL(),
-            nightscoutToken: LAAppGroupSettings.watchNightscoutToken()
+            nightscoutToken: LAAppGroupSettings.watchNightscoutToken(),
+            remoteSystem: LAAppGroupSettings.watchRemoteSystem(),
+            bolusIncrement: LAAppGroupSettings.watchBolusIncrement()
         )
     }
 }

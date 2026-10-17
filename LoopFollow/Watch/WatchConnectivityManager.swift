@@ -47,15 +47,18 @@ final class WatchConnectivityManager: NSObject {
     func currentSettings() -> WatchSettings {
         // Same range the phone's chart and stats use (TIR/TITR presets or custom lines).
         let thresholds = UnitSettingsStore.shared.effectiveThresholds()
+        let remoteSystem = WatchCommandDispatcher.activeRemoteSystem()
         return WatchSettings(
             lowMgdl: thresholds.low,
             highMgdl: thresholds.high,
-            remoteEnabled: LoopAPNSService().validateSetup(),
+            remoteEnabled: remoteSystem != nil,
             maxBolus: Storage.shared.maxBolus.value.doubleValue(for: .internationalUnit()),
             maxCarbs: Storage.shared.maxCarbs.value.doubleValue(for: .gram()),
             overridePresets: LAAppGroupSettings.watchOverridePresets(),
             nightscoutURL: Storage.shared.url.value,
-            nightscoutToken: Storage.shared.token.value
+            nightscoutToken: Storage.shared.token.value,
+            remoteSystem: remoteSystem ?? .loop,
+            bolusIncrement: Storage.shared.bolusIncrement.value.doubleValue(for: .internationalUnit())
         )
     }
 
@@ -298,8 +301,9 @@ extension WatchConnectivityManager: WCSessionDelegate {
 
         guard hasCommandFields || (recentWatchCommand && hasAlert) else { return }
 
-        var title = "Loop Confirmed ✓"
-        var body = "Command processed by Loop"
+        let systemName = (WatchCommandDispatcher.activeRemoteSystem() ?? .loop).displayName
+        var title = "\(systemName) Confirmed ✓"
+        var body = "Command processed by \(systemName)"
 
         if let commandType = userInfo["command_type"] as? String {
             switch commandType.lowercased() {
@@ -340,7 +344,13 @@ extension WatchConnectivityManager: WCSessionDelegate {
             Storage.shared.highLine.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.timeInRangeModeRaw.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.maxBolus.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            Storage.shared.maxCarbs.$value.dropFirst().map { _ in () }.eraseToAnyPublisher()
+            Storage.shared.maxCarbs.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.remoteType.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.device.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.sharedSecret.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.user.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.bundleId.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.bolusIncrement.$value.dropFirst().map { _ in () }.eraseToAnyPublisher()
         )
         .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
         .sink { [weak self] in

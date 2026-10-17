@@ -16,8 +16,9 @@ struct WatchBolusCommandView: View {
     @State private var alertMessage = ""
     @State private var showAlert = false
 
-    private var maxBolus: Double { max(0.05, LAAppGroupSettings.watchMaxBolus()) }
-    private let step = 0.05
+    private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
+    private let step: Double
+    private var maxBolus: Double { Self.maxBolus(step: step, system: remoteSystem) }
 
     /// The loop's recommendation, less any Watch bolus the loop has not seen yet.
     private var recBolus: Double? {
@@ -42,9 +43,36 @@ struct WatchBolusCommandView: View {
 
     init(snapshot: GlucoseSnapshot?) {
         self.snapshot = snapshot
-        let maxB = max(0.05, LAAppGroupSettings.watchMaxBolus())
+        let system = LAAppGroupSettings.watchRemoteSystem()
+        let step = Self.step(for: system)
+        self.step = step
+        let maxB = Self.maxBolus(step: step, system: system)
         let rec = snapshot.flatMap { Self.adjustedRecommendation(for: $0) } ?? 0
-        _bolusUnits = State(initialValue: rec > 0 ? min(rec, maxB).rounded(toPlaces: 2) : 0.05)
+        _bolusUnits = State(initialValue: rec > 0 ? Self.prefill(rec, maxBolus: maxB, step: step, system: system) : step)
+    }
+
+    /// Loop rounds on its side, so it keeps 0.05U steps. Trio delivers exactly the
+    /// amount sent, so it steps in the pump's increment.
+    private static func step(for system: WatchRemoteSystem) -> Double {
+        system == .trio ? max(0.001, LAAppGroupSettings.watchBolusIncrement()) : 0.05
+    }
+
+    private static func maxBolus(step: Double, system: WatchRemoteSystem) -> Double {
+        let maxBolus = max(step, LAAppGroupSettings.watchMaxBolus())
+        return system == .trio ? maxBolus.roundedDown(toStep: step) : maxBolus
+    }
+
+    /// Caps a suggested amount at the max bolus; for Trio it also rounds down to the increment.
+    private static func prefill(_ units: Double, maxBolus: Double, step: Double, system: WatchRemoteSystem) -> Double {
+        let capped = min(units, maxBolus)
+        return system == .trio ? capped.roundedDown(toStep: step) : capped.rounded(toPlaces: 2)
+    }
+
+    /// Two decimals, or three for pumps with a 0.025U increment.
+    private func formatted(_ units: Double) -> String {
+        let hundredths = step * 100
+        let digits = abs(hundredths - hundredths.rounded()) < 1e-9 ? 2 : 3
+        return String(format: "%.\(digits)f", units)
     }
 
     var body: some View {
@@ -53,7 +81,7 @@ struct WatchBolusCommandView: View {
                 // Recommended bolus tap-to-set row
                 if let rec = recBolus, rec > 0, let age = recBolusAge {
                     Button {
-                        bolusUnits = min(rec, maxBolus).rounded(toPlaces: 2)
+                        bolusUnits = Self.prefill(rec, maxBolus: maxBolus, step: step, system: remoteSystem)
                     } label: {
                         VStack(spacing: 2) {
                             Text("Rec: \(String(format: "%.2f", rec))U")
@@ -72,12 +100,12 @@ struct WatchBolusCommandView: View {
 
                 // Bolus amount stepper
                 VStack(spacing: 4) {
-                    Text(String(format: "%.2fU", bolusUnits))
+                    Text("\(formatted(bolusUnits))U")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
 
                     HStack(spacing: 16) {
                         Button {
-                            bolusUnits = max(0.05, (bolusUnits - step).rounded(toPlaces: 2))
+                            bolusUnits = max(step, (bolusUnits - step).rounded(toPlaces: 3))
                         } label: {
                             Image(systemName: "minus.circle.fill")
                                 .font(.title2)
@@ -86,7 +114,7 @@ struct WatchBolusCommandView: View {
                         .buttonStyle(.plain)
 
                         Button {
-                            bolusUnits = min(maxBolus, (bolusUnits + step).rounded(toPlaces: 2))
+                            bolusUnits = min(maxBolus, (bolusUnits + step).rounded(toPlaces: 3))
                         } label: {
                             Image(systemName: "plus.circle.fill")
                                 .font(.title2)
@@ -108,7 +136,7 @@ struct WatchBolusCommandView: View {
                 .disabled(isSending || bolusUnits <= 0)
                 .sheet(isPresented: $showConfirm) {
                     CrownConfirmView(
-                        title: "Send \(String(format: "%.2f", bolusUnits))U?",
+                        title: "Send \(formatted(bolusUnits))U?",
                         detail: "Turn the crown to confirm"
                     ) {
                         authenticateAndSend()
@@ -142,7 +170,7 @@ struct WatchBolusCommandView: View {
         }
         context.evaluatePolicy(
             .deviceOwnerAuthentication,
-            localizedReason: "Confirm identity to send \(String(format: "%.2f", bolusUnits))U insulin"
+            localizedReason: "Confirm identity to send \(formatted(bolusUnits))U insulin"
         ) { success, _ in
             DispatchQueue.main.async {
                 if success { sendBolus() } else {
@@ -173,7 +201,7 @@ struct WatchBolusCommandView: View {
                 } else if ok {
                     WatchPendingBolus(units: units, sentAt: Date()).save()
                     scheduleSuccessNotification(units: units)
-                    alertMessage = "Bolus sent! (\(String(format: "%.2f", units))U)"
+                    alertMessage = "Bolus sent! (\(formatted(units))U)"
                     showAlert = true
                 } else {
                     alertMessage = reply["error"] as? String ?? "Failed to send bolus"
@@ -193,7 +221,7 @@ struct WatchBolusCommandView: View {
         WKInterfaceDevice.current().play(.success)
         let content = UNMutableNotificationContent()
         content.title = "Bolus Sent ✓"
-        content.body = String(format: "%.2fU sent to Loop", units)
+        content.body = "\(formatted(units))U sent to \(remoteSystem.displayName)"
         content.sound = .default
         let request = UNNotificationRequest(
             identifier: "bolus-\(UUID().uuidString)",
@@ -208,5 +236,10 @@ private extension Double {
     func rounded(toPlaces places: Int) -> Double {
         let divisor = pow(10.0, Double(places))
         return (self * divisor).rounded() / divisor
+    }
+
+    func roundedDown(toStep step: Double) -> Double {
+        guard step > 0 else { return self }
+        return ((self / step + 1e-9).rounded(.down) * step).rounded(toPlaces: 3)
     }
 }
