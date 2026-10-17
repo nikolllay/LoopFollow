@@ -94,11 +94,26 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT }}
 
+      # Branches that only exist on this fork have no upstream branch to sync from
+      - name: Check for upstream branch
+        if: |
+          steps.workflow-permission.outputs.has_permission == 'true' &&
+          vars.SCHEDULED_SYNC != 'false' && github.repository_owner != 'loopandlearn'
+        id: upstream-branch
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${{ env.UPSTREAM_REPO }}.git" "${{ env.UPSTREAM_BRANCH }}" > /dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "${{ env.UPSTREAM_REPO }} has no '${{ env.UPSTREAM_BRANCH }}' branch, so the upstream sync is skipped." >> $GITHUB_STEP_SUMMARY
+          fi
+
       # This syncs any target branch to upstream branch of the same name
       - name: Sync upstream changes
         if: | # do not run the upstream sync action on the upstream repository
           steps.workflow-permission.outputs.has_permission == 'true' &&
-          vars.SCHEDULED_SYNC != 'false' && github.repository_owner != 'loopandlearn'
+          vars.SCHEDULED_SYNC != 'false' && github.repository_owner != 'loopandlearn' &&
+          steps.upstream-branch.outputs.exists == 'true'
         id: sync
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.2
         with:
