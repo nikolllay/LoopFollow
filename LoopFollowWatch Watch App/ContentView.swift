@@ -350,6 +350,8 @@ private struct GlucoseReadingView: View, Equatable {
     let bgColor: Color
 
     private static let infoFontSize: CGFloat = 20
+    /// Delta and IOB stand out a little from the rest.
+    private static let emphasisFontSize: CGFloat = 24
 
     var body: some View {
         if freshness == .stale {
@@ -367,16 +369,43 @@ private struct GlucoseReadingView: View, Equatable {
             .minimumScaleFactor(0.7)
     }
 
-    /// IOB in yellow and COB in purple, sharing a row; whichever is known.
-    private var insulinAndCarbs: Text? {
+    /// Delta in larger text, then the projection when there is one. Separate texts, so each keeps
+    /// its own size and only shrinks if the pair doesn't fit.
+    private var deltaAndProjection: some View {
         let s = snapshot
-        let iob = s.iob.map { _ in Text("IOB \(WatchFormat.iob(s)) U").foregroundColor(.yellow) }
-        let cob = s.cob.map { _ in Text("COB \(WatchFormat.cob(s)) g").foregroundColor(.purple) }
-        switch (iob, cob) {
-        case let (iob?, cob?): return Text("\(iob)  \(cob)")
-        case let (iob?, nil): return iob
-        case let (nil, cob?): return cob
-        case (nil, nil): return nil
+        return HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("Δ \(WatchFormat.delta(s))")
+                .font(.system(size: Self.emphasisFontSize))
+            if s.projected != nil {
+                Text("Proj \(WatchFormat.projected(s))")
+                    .font(.system(size: Self.infoFontSize))
+            }
+        }
+        .foregroundColor(.white)
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+    }
+
+    /// IOB in larger yellow text and COB in purple, side by side; whichever is known. Units sit
+    /// tight against the numbers so the pair fits the row at these sizes.
+    @ViewBuilder
+    private var insulinAndCarbs: some View {
+        let s = snapshot
+        if s.iob != nil || s.cob != nil {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                if s.iob != nil {
+                    Text("IOB \(WatchFormat.iob(s))U")
+                        .font(.system(size: Self.emphasisFontSize))
+                        .foregroundColor(.yellow)
+                }
+                if s.cob != nil {
+                    Text("COB \(WatchFormat.cob(s))g")
+                        .font(.system(size: Self.infoFontSize))
+                        .foregroundColor(.purple)
+                }
+            }
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
         }
     }
 
@@ -401,28 +430,29 @@ private struct GlucoseReadingView: View, Equatable {
                 .lineLimit(1)
                 .foregroundColor(bgColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                // Digits and arrows have no descenders; drop most of the empty space below them.
+                // Digits and arrows sit well inside the font's line: drop the empty space above
+                // them, and most of it below, to leave room for the rows.
+                .padding(.top, -12)
                 .padding(.bottom, -4)
 
             VStack(alignment: .leading, spacing: 0) {
-                infoRow(s.projected != nil
-                    ? Text("Δ \(WatchFormat.delta(s))   Proj \(WatchFormat.projected(s))")
-                    : Text("Δ \(WatchFormat.delta(s))"))
+                deltaAndProjection
 
-                if let insulinAndCarbs {
-                    infoRow(insulinAndCarbs)
-                }
+                insulinAndCarbs
 
-                if !s.basalRate.isEmpty {
+                // The basal is stale while the loop isn't running, so the warning takes its row and
+                // the BG number keeps its size.
+                if s.isNotLooping {
+                    infoRow(Text("⚠ Loop inactive"), color: .yellow)
+                } else if !s.basalRate.isEmpty {
                     infoRow(Text("Basal \(WatchFormat.basal(s)) U/h"), color: .blue)
                 }
 
                 updatedCounter
-
-                if s.isNotLooping {
-                    infoRow(Text("⚠ Loop inactive"), color: .yellow)
-                }
             }
+            // The rows get their full height first; when the page runs short, the BG number
+            // gives way instead of the rows shrinking unevenly.
+            .layoutPriority(1)
         }
         .padding(.leading, 4)
         // Keep clear of the icon column on the right.
