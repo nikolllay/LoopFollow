@@ -52,6 +52,9 @@ final class WatchNightscoutFetcher: NSObject {
         let entriesURL = buildEntriesURL(base: baseURL)
         var request = URLRequest(url: entriesURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        // A background refresh only has seconds to run; a stalled server must not hold the
+        // radio and the task for the default minute.
+        request.timeoutInterval = 15
         applyAuth(to: &request)
 
         let task = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in

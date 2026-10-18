@@ -196,9 +196,7 @@ enum LAAppGroupSettings {
         static let watchNightscoutToken = "watch.nightscoutToken"
     }
 
-    private static var defaults: UserDefaults? {
-        UserDefaults(suiteName: AppGroupID.current())
-    }
+    private static let defaults = UserDefaults(suiteName: AppGroupID.current())
 
     // MARK: - Thresholds (Write)
 

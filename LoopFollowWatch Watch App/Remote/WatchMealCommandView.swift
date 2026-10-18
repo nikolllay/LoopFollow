@@ -29,7 +29,8 @@ struct WatchMealCommandView: View {
         self.onFinished = onFinished
     }
 
-    private var maxCarbs: Int { max(5, Int(LAAppGroupSettings.watchMaxCarbs())) }
+    // Read once, not on every turn of the crown.
+    private let maxCarbs = max(5, Int(LAAppGroupSettings.watchMaxCarbs()))
     private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
 
     /// The crown works on a Double; it moves carbs in 1g steps, like the buttons.

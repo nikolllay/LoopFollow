@@ -43,8 +43,8 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
             case let connectivityTask as WKWatchConnectivityRefreshBackgroundTask:
                 // Hold the task open — WatchConnectivity will deliver the pending
                 // transferUserInfo to session(_:didReceiveUserInfo:) while the app
-                // is awake. WatchSessionReceiver completes it after saving the snapshot.
-                WatchSessionReceiver.shared.pendingConnectivityTask = connectivityTask
+                // is awake. WatchSessionReceiver completes it once that is saved.
+                WatchSessionReceiver.shared.hold(connectivityTask)
 
             default:
                 task.setTaskCompletedWithSnapshot(false)
@@ -63,29 +63,40 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         let contextSnapshot = Self.decodeContextSnapshot()
         let storeSnapshot = GlucoseSnapshotStore.shared.load()
 
+        let finish = {
+            DispatchQueue.main.async {
+                WatchAppDelegate.scheduleNextRefresh()
+                task.setTaskCompletedWithSnapshot(false)
+            }
+        }
+        // Nightscout can't have anything newer than a reading taken less than a reading
+        // interval ago, so the radio stays off.
+        let pollNightscout = {
+            let newest = GlucoseSnapshotStore.shared.load()?.updatedAt ?? .distantPast
+            if Date().timeIntervalSince(newest) < WatchRefreshPolicy.readingInterval {
+                finish()
+            } else {
+                WatchNightscoutFetcher.shared.handleRefreshTask(completion: finish)
+            }
+        }
+
         if let ctx = contextSnapshot,
            ctx.updatedAt > (storeSnapshot?.updatedAt ?? .distantPast)
         {
             WatchAlertManager.shared.checkAndAlert(snapshot: ctx)
+            // Recorded like any other delivery, so a poll that finds the same reading doesn't
+            // count it as new, save a BG-only copy over this one and reload again.
+            let isNewReading = ComplicationRefreshCounter.shared.shouldReloadAndRecord(for: ctx)
             GlucoseSnapshotStore.shared.save(ctx) {
                 ChannelDiagnosticsStore.shared.record(.watchWake)
-                WatchSessionReceiver.shared.triggerComplicationReload()
-                // Also poll NightScout — dedup gate prevents a double reload if same reading.
-                WatchNightscoutFetcher.shared.handleRefreshTask {
-                    DispatchQueue.main.async {
-                        WatchAppDelegate.scheduleNextRefresh()
-                        task.setTaskCompletedWithSnapshot(false)
-                    }
+                if isNewReading {
+                    WatchSessionReceiver.shared.triggerComplicationReload()
                 }
+                pollNightscout()
             }
         } else {
             // No newer applicationContext — poll NightScout directly.
-            WatchNightscoutFetcher.shared.handleRefreshTask {
-                DispatchQueue.main.async {
-                    WatchAppDelegate.scheduleNextRefresh()
-                    task.setTaskCompletedWithSnapshot(false)
-                }
-            }
+            pollNightscout()
         }
     }
 

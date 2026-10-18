@@ -12,6 +12,8 @@ struct GlucoseChartView: View {
     /// When the phone last downloaded treatments; nil when unknown.
     let treatmentsAsOf: TimeInterval?
     let unit: GlucoseSnapshot.Unit
+    /// Range lines and BG colors.
+    let colors: GlucoseColor.Scheme
 
     /// Hours shown; the phone sends three.
     private let hours = 3.0
@@ -28,8 +30,6 @@ struct GlucoseChartView: View {
     private static let xAxisHeight: CGFloat = 20
     /// Once BG is this far past the last treatment download, missing markers may just be unknown.
     private static let staleTreatmentsAfter: TimeInterval = 15 * 60
-
-    private var thresholds: (low: Double, high: Double) { LAAppGroupSettings.thresholdsMgdl() }
 
     private func display(_ mgdl: Double) -> Double {
         unit == .mmol ? GlucoseConversion.toMmol(mgdl) : mgdl
@@ -51,7 +51,7 @@ struct GlucoseChartView: View {
     /// BG axis range in mg/dL covering the readings, markers and range lines, with room above
     /// the highest marker for its amount label when any label is shown.
     private func mgdlRange(markers: [Double], hasLabels: Bool) -> (low: Double, high: Double) {
-        let values = points.map { Double($0.mgdl) } + markers + [thresholds.low, thresholds.high]
+        let values = points.map { Double($0.mgdl) } + markers + [colors.lowMgdl, colors.highMgdl]
         let low = max(0, (values.min() ?? 40) - 10)
         let high = (values.max() ?? 300) + 10 + (hasLabels ? 25 : 0)
         return (low, high)
@@ -90,10 +90,10 @@ struct GlucoseChartView: View {
         let range = mgdlRange(markers: drawn.map { Double($0.treatment.mgdl) }, hasLabels: drawn.contains(where: \.showsLabel))
 
         return Chart {
-            RuleMark(y: .value("low", display(thresholds.low)))
+            RuleMark(y: .value("low", display(colors.lowMgdl)))
                 .foregroundStyle(.red.opacity(0.5))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-            RuleMark(y: .value("high", display(thresholds.high)))
+            RuleMark(y: .value("high", display(colors.highMgdl)))
                 .foregroundStyle(.orange.opacity(0.5))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
 
@@ -103,7 +103,7 @@ struct GlucoseChartView: View {
                     y: .value("bg", display(Double(point.mgdl)))
                 )
                 .symbolSize(12)
-                .foregroundStyle(GlucoseColor.color(forMgdl: Double(point.mgdl), thresholds: thresholds))
+                .foregroundStyle(colors.color(forMgdl: Double(point.mgdl)))
             }
 
             if let asOf = staleTreatmentsAsOf, asOf >= start.timeIntervalSince1970 {
@@ -143,15 +143,18 @@ struct GlucoseChartView: View {
             let treatment = item.treatment
             let x = PlottableValue.value("time", Date(timeIntervalSince1970: item.drawnDate))
             let y = PlottableValue.value("treatment", display(Double(treatment.mgdl)))
-            PointMark(x: x, y: y)
+            let marker = PointMark(x: x, y: y)
                 .symbol(treatment.kind == .smb ? AnyChartSymbolShape(DownwardTriangle()) : AnyChartSymbolShape(BasicChartSymbolShape.circle))
                 .symbolSize(treatment.kind == .smb ? 22 : 28)
                 .foregroundStyle((treatment.kind == .carbs ? Color.orange : Color.blue).opacity(0.75))
-                .annotation(position: .top, alignment: .center, spacing: 1) {
-                    if item.showsLabel {
-                        Text(treatment.label).font(.system(size: 9)).foregroundStyle(.white)
-                    }
+            // Most SMB labels don't fit; those markers get no annotation at all.
+            if item.showsLabel {
+                marker.annotation(position: .top, alignment: .center, spacing: 1) {
+                    Text(treatment.label).font(.system(size: 9)).foregroundStyle(.white)
                 }
+            } else {
+                marker
+            }
             if treatment.kind == .carbs {
                 // A white ring keeps carbs from reading as an orange above-range BG dot.
                 PointMark(x: x, y: y)

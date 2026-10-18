@@ -30,6 +30,12 @@ final class WatchConnectivityManager: NSObject {
     private var refreshBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// Settings most recently handed to WatchConnectivity, used to skip redundant pushes.
     private var lastSentSettings: WatchSettings?
+    /// What the last snapshot send carried, and when. The phone refreshes far more often than
+    /// anything changes, and every send can wake the Watch, so an identical send is skipped.
+    private var lastSentContent: SentContent?
+    private var lastSentAt: Date = .distantPast
+    /// Unchanged state still goes out this often, so the Watch's 24-hour stats keep moving.
+    private static let resendInterval: TimeInterval = 15 * 60
     private var cancellables = Set<AnyCancellable>()
 
     override private init() {
@@ -77,10 +83,34 @@ final class WatchConnectivityManager: NSObject {
         return try encoder.encode(snapshot)
     }
 
+    /// The parts of a payload the Watch acts on, without the build time that makes every
+    /// payload different. When treatments were last downloaded is left out as well: the Watch
+    /// only compares it with the newest reading, and a new reading brings it along.
+    private struct SentContent: Equatable {
+        let settings: WatchSettings
+        let snapshot: GlucoseSnapshot
+        let newestReading: TimeInterval?
+        let readingCount: Int
+        let treatments: [WatchTreatmentHistory.Treatment]?
+    }
+
+    /// Call on the main thread, like `makePayload`.
+    private func sentContent(snapshot: GlucoseSnapshot, now: Date) -> SentContent {
+        let readings = Thread.isMainThread ? MainViewController.shared?.bgData ?? [] : []
+        return SentContent(
+            settings: currentSettings(),
+            snapshot: snapshot,
+            newestReading: readings.last?.date,
+            readingCount: readings.count,
+            treatments: currentTreatmentHistory(now: now)?.treatments
+        )
+    }
+
     /// Every payload carries the current settings, so whichever channel reaches the
     /// Watch first also brings it up to date. `updateApplicationContext` replaces the
     /// whole context, which is another reason everything must always travel together.
-    /// Call on the main thread.
+    /// Call on the main thread, and only once storage is ready: before the first unlock after
+    /// a restart the settings read as defaults, which would wipe the Watch's own copy.
     private func makePayload(snapshot: GlucoseSnapshot?) -> [String: Any] {
         var payload: [String: Any] = [:]
         let settings = currentSettings()
@@ -214,9 +244,9 @@ final class WatchConnectivityManager: NSObject {
     }
 
     private func pushSettings() {
-        guard WCSession.isSupported() else { return }
+        guard WCSession.isSupported(), StorageReadiness.ready.value else { return }
         let session = WCSession.default
-        guard session.activationState == .activated, session.isPaired else { return }
+        guard session.activationState == .activated, session.isPaired, session.isWatchAppInstalled else { return }
 
         let payload = makePayload(snapshot: GlucoseSnapshotStore.shared.load())
         do {
@@ -227,86 +257,86 @@ final class WatchConnectivityManager: NSObject {
         if session.isReachable, let settings = payload[WatchSettings.payloadKey] {
             session.sendMessage([WatchSettings.payloadKey: settings], replyHandler: nil, errorHandler: nil)
         }
-        LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: settings pushed to Watch")
+        LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: settings pushed to Watch", isDebug: true)
     }
 
     // MARK: - Send Snapshot
 
     /// Sends the latest GlucoseSnapshot, with settings, history and stats, to the Watch.
     /// Call on the main thread so the payload includes the BG readings.
-    /// No-ops silently if Watch is not paired or reachable.
-    func send(snapshot: GlucoseSnapshot) {
-        guard WCSession.isSupported() else { return }
+    /// Skips quietly when there is no Watch app, and when nothing has changed since the last
+    /// send unless `force` is set; a forced resend of unchanged state goes out as a live
+    /// message only, since the Watch already has the rest.
+    func send(snapshot: GlucoseSnapshot, force: Bool = false) {
+        guard WCSession.isSupported(), StorageReadiness.ready.value else { return }
 
         let session = WCSession.default
+        // Most LoopFollow users have no Watch app; build and queue nothing for them.
+        guard session.activationState == .activated, session.isPaired, session.isWatchAppInstalled else { return }
 
-        guard session.activationState == .activated else {
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: session not activated, skipping send")
+        let now = Date()
+        let content = sentContent(snapshot: snapshot, now: now)
+        let unchanged = content == lastSentContent && now.timeIntervalSince(lastSentAt) < Self.resendInterval
+        if unchanged, !force { return }
+
+        let payload = makePayload(snapshot: snapshot)
+        guard payload["snapshot"] != nil else {
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: failed to encode snapshot")
             return
         }
 
-        guard session.isPaired else {
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: no paired Watch, skipping send")
-            return
+        // Warn if Watch hasn't ACK'd this or a recent snapshot.
+        let behindBy = snapshot.updatedAt.timeIntervalSince1970 - lastWatchAckTimestamp
+        if lastWatchAckTimestamp > 0, behindBy > 600 {
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK is \(Int(behindBy))s behind — Watch may be missing deliveries")
         }
 
+        // The Watch app is open: deliver now, and queue it only if that fails.
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in session.transferUserInfo(payload) })
+        }
+        guard !unchanged else { return }
+
+        // Only the latest state matters, so a queued older one is dropped; a queued bolus or
+        // carb confirmation is not.
+        session.outstandingUserInfoTransfers
+            .filter { $0.userInfo["snapshot"] != nil }
+            .forEach { $0.cancel() }
+
+        // applicationContext: always keep latest state for the app refresh path.
         do {
-            let payload = makePayload(snapshot: snapshot)
-            guard payload["snapshot"] != nil else {
-                throw CocoaError(.coderInvalidValue)
-            }
-
-            // Warn if Watch hasn't ACK'd this or a recent snapshot.
-            let behindBy = snapshot.updatedAt.timeIntervalSince1970 - lastWatchAckTimestamp
-            if lastWatchAckTimestamp > 0, behindBy > 600 {
-                LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK is \(Int(behindBy))s behind — Watch may be missing deliveries")
-            }
-
-            // sendMessage: immediate delivery when Watch app is in foreground.
-            if session.isReachable {
-                session.sendMessage(payload, replyHandler: nil, errorHandler: nil)
-                LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: snapshot sent via sendMessage (reachable)")
-            }
-
-            // Cancel any pending transferUserInfo — only the latest snapshot matters.
-            session.outstandingUserInfoTransfers.forEach { $0.cancel() }
-
-            // applicationContext: always keep latest state for the app refresh path.
-            do {
-                try session.updateApplicationContext(payload)
-            } catch {
-                LogManager.shared.log(
-                    category: .watch,
-                    message: "WatchConnectivityManager: failed to update applicationContext — \(error)"
-                )
-            }
-
-            // Delivery cadence:
-            //   Every 30 min → transferCurrentComplicationUserInfo (high-priority wake, 50/day budget)
-            //   Every  5 min → transferUserInfo (queued fallback, no documented cap)
-            // Outstanding transfers are cancelled above so at most one is ever pending.
-            let now = Date()
-            let transferLog: String
-
-            if session.isComplicationEnabled,
-               WatchRefreshPolicy.isComplicationPushDue(
-                   now: now,
-                   lastPush: lastComplicationPushTime,
-                   remainingTransfers: session.remainingComplicationUserInfoTransfers
-               )
-            {
-                session.transferCurrentComplicationUserInfo(payload)
-                lastComplicationPushTime = now
-                transferLog = "snapshot sent via transferCurrentComplicationUserInfo"
-            } else {
-                session.transferUserInfo(payload)
-                transferLog = "snapshot sent via transferUserInfo"
-            }
-
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: \(transferLog)")
+            try session.updateApplicationContext(payload)
+            lastSentContent = content
+            lastSentAt = now
         } catch {
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: failed to encode snapshot — \(error)")
+            LogManager.shared.log(
+                category: .watch,
+                message: "WatchConnectivityManager: failed to update applicationContext — \(error)"
+            )
         }
+
+        // An open Watch app already has it from the message above and reloads its own
+        // complications. Otherwise:
+        //   Every 30 min → transferCurrentComplicationUserInfo (high-priority wake, 50/day budget)
+        //   Every  5 min → transferUserInfo (queued fallback, no documented cap)
+        // Outstanding transfers are cancelled above so at most one is ever pending.
+        guard !session.isReachable else { return }
+        let transferLog: String
+        if session.isComplicationEnabled,
+           WatchRefreshPolicy.isComplicationPushDue(
+               now: now,
+               lastPush: lastComplicationPushTime,
+               remainingTransfers: session.remainingComplicationUserInfoTransfers
+           )
+        {
+            session.transferCurrentComplicationUserInfo(payload)
+            lastComplicationPushTime = now
+            transferLog = "snapshot sent via transferCurrentComplicationUserInfo"
+        } else {
+            session.transferUserInfo(payload)
+            transferLog = "snapshot sent via transferUserInfo"
+        }
+        LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: \(transferLog)", isDebug: true)
     }
 }
 
@@ -322,18 +352,17 @@ extension WatchConnectivityManager: WCSessionDelegate {
             LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: activation failed — \(error)")
         } else {
             LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: activation complete — state \(activationState.rawValue)")
-            // Payloads are built on main, where the BG readings live.
-            DispatchQueue.main.async { self.pushSettings() }
+            // Payloads are built on main, where the BG readings live, from settings that can
+            // only be read once storage is ready.
+            DispatchQueue.main.async { StorageReadiness.whenReady { self.pushSettings() } }
         }
     }
 
-    /// When the Watch app comes to the foreground, send the latest snapshot immediately
-    /// so the Watch app has fresh data without waiting for the next BG poll.
-    /// Receives ACKs from the Watch (sent after each snapshot is saved).
+    /// Receives ACKs from the Watch (sent after each snapshot is saved, in debug builds).
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
         if let ackTimestamp = message["watchAck"] as? TimeInterval {
-            lastWatchAckTimestamp = ackTimestamp
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK received for snapshot at \(ackTimestamp)")
+            DispatchQueue.main.async { self.lastWatchAckTimestamp = ackTimestamp }
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK received for snapshot at \(ackTimestamp)", isDebug: true)
         }
     }
 
@@ -347,7 +376,7 @@ extension WatchConnectivityManager: WCSessionDelegate {
             DispatchQueue.main.async {
                 let fetching = self.refreshForWatch()
                 // Answer with what the phone has now; what it fetches follows a few seconds later.
-                var reply = self.makePayload(snapshot: self.currentSnapshot())
+                var reply = StorageReadiness.ready.value ? self.makePayload(snapshot: self.currentSnapshot()) : [:]
                 reply["refreshing"] = fetching
                 replyHandler(reply)
             }
@@ -355,31 +384,50 @@ extension WatchConnectivityManager: WCSessionDelegate {
         }
         if message["watchRequestSettings"] != nil {
             DispatchQueue.main.async {
-                replyHandler(self.makePayload(snapshot: GlucoseSnapshotStore.shared.load()))
+                replyHandler(StorageReadiness.ready.value ? self.makePayload(snapshot: GlucoseSnapshotStore.shared.load()) : [:])
                 LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: answered Watch settings request")
             }
             return
         }
         LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: received Watch command — \(message["watchCmd"] as? String ?? "unknown")")
-        lastWatchCommandDate = Date()
-        WatchCommandDispatcher.shared.handle(message: message, replyHandler: replyHandler)
+        // Commands read the phone's settings, which belong to the main thread.
+        DispatchQueue.main.async {
+            self.lastWatchCommandDate = Date()
+            WatchCommandDispatcher.shared.handle(message: message, replyHandler: replyHandler)
+        }
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
         if let ackTimestamp = userInfo["watchAck"] as? TimeInterval {
-            lastWatchAckTimestamp = ackTimestamp
-            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK (userInfo) received for snapshot at \(ackTimestamp)")
+            DispatchQueue.main.async { self.lastWatchAckTimestamp = ackTimestamp }
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK (userInfo) received for snapshot at \(ackTimestamp)", isDebug: true)
         }
     }
 
+    /// When the Watch app comes to the foreground, send the latest snapshot immediately
+    /// so the Watch app has fresh data without waiting for the next BG poll.
     func sessionReachabilityDidChange(_ session: WCSession) {
         guard session.isReachable else { return }
         DispatchQueue.main.async {
             if let snapshot = GlucoseSnapshotStore.shared.load() {
-                self.send(snapshot: snapshot)
-                LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch became reachable — snapshot pushed")
+                self.send(snapshot: snapshot, force: true)
+                LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch became reachable — snapshot pushed", isDebug: true)
             } else {
                 self.pushSettings()
+            }
+        }
+    }
+
+    /// Sends everything as soon as the Watch app is installed, rather than at the next reading.
+    func sessionWatchStateDidChange(_ session: WCSession) {
+        guard session.isPaired, session.isWatchAppInstalled else { return }
+        DispatchQueue.main.async {
+            StorageReadiness.whenReady {
+                if let snapshot = GlucoseSnapshotStore.shared.load() {
+                    self.send(snapshot: snapshot, force: true)
+                } else {
+                    self.pushSettings()
+                }
             }
         }
     }
@@ -400,7 +448,7 @@ extension WatchConnectivityManager: WCSessionDelegate {
     func forwardCommandReturnToWatch(userInfo: [AnyHashable: Any]) {
         guard WCSession.isSupported() else { return }
         let session = WCSession.default
-        guard session.activationState == .activated, session.isPaired else { return }
+        guard session.activationState == .activated, session.isPaired, session.isWatchAppInstalled else { return }
 
         let hasCommandFields = userInfo["command_status"] != nil || userInfo["command_type"] != nil
         let recentWatchCommand = Date().timeIntervalSince(lastWatchCommandDate) < 120

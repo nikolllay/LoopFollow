@@ -22,14 +22,12 @@ struct WatchBolusCommandView: View {
     @State private var closeAfterAlert = false
     @FocusState private var amountFocused: Bool
 
-    private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
+    // Worked out once, not on every turn of the crown.
+    private let remoteSystem: WatchRemoteSystem
     private let step: Double
-    private var maxBolus: Double { Self.maxBolus(step: step, system: remoteSystem) }
-
+    private let maxBolus: Double
     /// The loop's recommendation, less any Watch bolus the loop has not seen yet.
-    private var recBolus: Double? {
-        snapshot.flatMap { Self.adjustedRecommendation(for: $0) }
-    }
+    private let recBolus: Double?
 
     private static func adjustedRecommendation(for snapshot: GlucoseSnapshot) -> Double? {
         guard let rec = snapshot.recBolus else { return nil }
@@ -56,12 +54,16 @@ struct WatchBolusCommandView: View {
         self.onFinished = onFinished
         let system = LAAppGroupSettings.watchRemoteSystem()
         let step = Self.step(for: system)
-        self.step = step
         let maxB = Self.maxBolus(step: step, system: system)
+        let adjustedRec = snapshot.flatMap { Self.adjustedRecommendation(for: $0) }
+        remoteSystem = system
+        self.step = step
+        maxBolus = maxB
+        recBolus = adjustedRec
         // Only a fresh recommendation fills the amount in; an older one must be picked from its
         // row, which shows its age.
         let isFresh = (Self.recommendationAge(of: snapshot) ?? .max) < 5
-        let rec = isFresh ? snapshot.flatMap { Self.adjustedRecommendation(for: $0) } ?? 0 : 0
+        let rec = isFresh ? adjustedRec ?? 0 : 0
         _bolusUnits = State(initialValue: rec > 0 ? Self.prefill(rec, maxBolus: maxB, step: step, system: system) : step)
     }
 

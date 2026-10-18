@@ -21,9 +21,16 @@ final class WatchSessionReceiver: NSObject {
     static let snapshotReceivedNotification = Notification.Name("WatchSnapshotReceived")
     static let settingsRefreshedNotification = Notification.Name("WatchSettingsRefreshed")
 
-    /// Held open while WatchConnectivity delivers a pending transferUserInfo in the background.
-    /// Completed after the snapshot is saved to disk.
-    var pendingConnectivityTask: WKWatchConnectivityRefreshBackgroundTask?
+    /// Background wakes held open while WatchConnectivity delivers content. Main thread only.
+    private var heldConnectivityTasks: [WKWatchConnectivityRefreshBackgroundTask] = []
+    private var sessionObservations: [NSKeyValueObservation] = []
+    /// Guards the two below, which the WatchConnectivity and store queues use as well as main.
+    private let stateLock = NSLock()
+    /// Snapshots received and not yet saved; held wakes wait for them.
+    private var snapshotsBeingSaved = 0
+    /// The settings, history, treatments and stats last applied, by payload key. The phone sends
+    /// each update on two or three channels, and the copies after the first change nothing.
+    private var lastApplied: [String: Data] = [:]
 
     // MARK: - Init
 
@@ -40,8 +47,63 @@ final class WatchSessionReceiver: NSObject {
             return
         }
         WCSession.default.delegate = self
+        // A held wake ends once WatchConnectivity has nothing more to deliver, as in Apple's
+        // sample; one left open keeps using background time until watchOS ends the app.
+        sessionObservations = [
+            WCSession.default.observe(\.activationState) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.completeHeldTasksIfIdle() }
+            },
+            WCSession.default.observe(\.hasContentPending) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.completeHeldTasksIfIdle() }
+            },
+        ]
         WCSession.default.activate()
         os_log("WatchSessionReceiver: WCSession activation requested", log: watchLog, type: .debug)
+    }
+
+    /// Holds a background wake open until WatchConnectivity has delivered what it woke the app
+    /// for. Call on the main thread.
+    func hold(_ task: WKWatchConnectivityRefreshBackgroundTask) {
+        heldConnectivityTasks.append(task)
+        completeHeldTasksIfIdle()
+    }
+
+    /// Ends the held wakes once WatchConnectivity has nothing more to deliver and every snapshot
+    /// it brought is saved, with its complication reload requested, so watchOS doesn't suspend
+    /// the app halfway. Main thread only.
+    private func completeHeldTasksIfIdle() {
+        stateLock.lock()
+        let saving = snapshotsBeingSaved > 0
+        stateLock.unlock()
+        let session = WCSession.default
+        guard !heldConnectivityTasks.isEmpty, !saving,
+              session.activationState == .activated, !session.hasContentPending
+        else { return }
+        heldConnectivityTasks.forEach { $0.setTaskCompletedWithSnapshot(false) }
+        heldConnectivityTasks.removeAll()
+    }
+
+    private func beginSave() {
+        stateLock.lock()
+        snapshotsBeingSaved += 1
+        stateLock.unlock()
+    }
+
+    /// Main thread only, after the complication reload has been requested.
+    private func endSave() {
+        stateLock.lock()
+        snapshotsBeingSaved -= 1
+        stateLock.unlock()
+        completeHeldTasksIfIdle()
+    }
+
+    /// True the first time this part of a payload arrives; false for its copies on other channels.
+    private func isNewDelivery(_ data: Data, of key: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard lastApplied[key] != data else { return false }
+        lastApplied[key] = data
+        return true
     }
 
     /// Triggers a complication timeline reload. Called from background refresh tasks
@@ -130,6 +192,7 @@ extension WatchSessionReceiver: WCSessionDelegate {
     @discardableResult
     func applySettings(from payload: [String: Any]) -> Bool {
         guard let data = payload[WatchSettings.payloadKey] as? Data else { return false }
+        guard isNewDelivery(data, of: WatchSettings.payloadKey) else { return true }
         do {
             let settings = try WatchSettings.decoded(from: data)
             settings.applyToAppGroup()
@@ -145,12 +208,14 @@ extension WatchSessionReceiver: WCSessionDelegate {
 
     /// Persists BG history carried in a payload for the graph and complications.
     func applyHistory(from payload: [String: Any]) {
-        guard let data = payload[WatchGlucoseHistory.payloadKey] as? Data else { return }
+        guard let data = payload[WatchGlucoseHistory.payloadKey] as? Data,
+              isNewDelivery(data, of: WatchGlucoseHistory.payloadKey)
+        else { return }
         do {
             let incoming = try WatchGlucoseHistory.decoded(from: data)
             // An old applicationContext must not replace readings the Watch fetched itself.
-            let storedLatest = WatchGlucoseHistory.load()?.points.last?.date ?? 0
-            guard (incoming.points.last?.date ?? 0) >= storedLatest else { return }
+            let stored = WatchGlucoseHistory.load()
+            guard (incoming.points.last?.date ?? 0) >= (stored?.points.last?.date ?? 0), incoming != stored else { return }
             incoming.save()
         } catch {
             os_log("WatchSessionReceiver: history decode failed — %{public}@", log: watchLog, type: .error, error.localizedDescription)
@@ -159,15 +224,18 @@ extension WatchSessionReceiver: WCSessionDelegate {
 
     /// Persists the boluses, SMBs and carbs carried in a payload for the graph.
     func applyTreatments(from payload: [String: Any]) {
-        guard let data = payload[WatchTreatmentHistory.payloadKey] as? Data else { return }
+        guard let data = payload[WatchTreatmentHistory.payloadKey] as? Data,
+              isNewDelivery(data, of: WatchTreatmentHistory.payloadKey)
+        else { return }
         do {
             let incoming = try WatchTreatmentHistory.decoded(from: data)
-            // Payloads arrive over several channels; an older one must not replace a newer one.
-            // A stored time well ahead of this clock came from a phone clock that was later set
-            // back, and must not block updates until real time catches up with it.
+            // Payloads arrive over several channels; an older one must not replace a newer one,
+            // and the one already stored needn't be written again. A stored time well ahead of
+            // this clock came from a phone clock that was later set back, and must not block
+            // updates until real time catches up with it.
             let now = Date().timeIntervalSince1970
             let stored = WatchTreatmentHistory.load()?.generatedAt ?? 0
-            guard incoming.generatedAt >= (stored <= now + 300 ? stored : 0) else { return }
+            guard incoming.generatedAt > (stored <= now + 300 ? stored : 0) else { return }
             incoming.save()
         } catch {
             os_log("WatchSessionReceiver: treatments decode failed — %{public}@", log: watchLog, type: .error, error.localizedDescription)
@@ -177,6 +245,7 @@ extension WatchSessionReceiver: WCSessionDelegate {
     /// Persists the iPhone's 24-hour stats summary carried in a payload.
     func applyStats(from payload: [String: Any]) {
         guard let data = payload[WatchStatsSummary.payloadKey] as? Data,
+              isNewDelivery(data, of: WatchStatsSummary.payloadKey),
               let stats = try? WatchStatsSummary.decoded(from: data)
         else { return }
         stats.save()
@@ -194,10 +263,17 @@ extension WatchSessionReceiver: WCSessionDelegate {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let snapshot = try decoder.decode(GlucoseSnapshot.self, from: data)
+            // The context can be older than what the Watch has fetched itself since.
+            let (save, isNewReading) = gate(snapshot)
+            guard save else { return }
+            beginSave()
             GlucoseSnapshotStore.shared.save(snapshot) { [weak self] in
                 os_log("WatchSessionReceiver: bootstrapped snapshot from applicationContext", log: watchLog, type: .debug)
-                self?.reloadComplications()
                 DispatchQueue.main.async {
+                    if isNewReading {
+                        self?.reloadComplicationsOnMainThread()
+                    }
+                    self?.endSave()
                     NotificationCenter.default.post(
                         name: WatchSessionReceiver.snapshotReceivedNotification,
                         object: nil,
@@ -241,23 +317,16 @@ extension WatchSessionReceiver: WCSessionDelegate {
         if let _ = payload["watchLoopReturn"] {
             let title = payload["title"] as? String ?? "Loop Confirmed ✓"
             let body = payload["body"] as? String ?? "Command processed by Loop"
-            let task = pendingConnectivityTask
-            pendingConnectivityTask = nil
             DispatchQueue.main.async {
                 self.showLoopReturnConfirmation(title: title, body: body)
-                task?.setTaskCompletedWithSnapshot(false)
+                self.completeHeldTasksIfIdle()
             }
             return
         }
 
         guard let data = payload["snapshot"] as? Data else {
             os_log("WatchSessionReceiver: %{public}@ — no snapshot key", log: watchLog, type: .debug, source)
-            // A settings-only delivery still ends a background wake, but a reply to our own
-            // request is not the transfer that wake is waiting for.
-            guard source != "settingsReply", source != "refreshReply" else { return }
-            let task = pendingConnectivityTask
-            pendingConnectivityTask = nil
-            DispatchQueue.main.async { task?.setTaskCompletedWithSnapshot(false) }
+            DispatchQueue.main.async { self.completeHeldTasksIfIdle() }
             return
         }
         do {
@@ -265,43 +334,27 @@ extension WatchSessionReceiver: WCSessionDelegate {
             decoder.dateDecodingStrategy = .iso8601
             let snapshot = try decoder.decode(GlucoseSnapshot.self, from: data)
             WatchAlertManager.shared.checkAndAlert(snapshot: snapshot)
-            let stored = GlucoseSnapshotStore.shared.load()
-            // Only a new reading reloads complications, which have a daily budget.
-            let isNewReading = ComplicationRefreshCounter.shared.shouldReloadAndRecord(for: snapshot)
-            // The same reading may still bring news worth showing: the phone's copy of a reading the
-            // Watch fetched itself (BG only) adds IOB, COB and loop state, and a later loop run
-            // (after a bolus or carbs, or a refresh) updates them. Strictly newer only, so an older
-            // copy arriving late on another channel can't undo it.
-            let updatesSameReading = stored.map { current in
-                guard current.updatedAt == snapshot.updatedAt else { return false }
-                let completesWatchFetch = current.iob == nil && current.loopLastRunAt == nil
-                    && (snapshot.iob != nil || snapshot.loopLastRunAt != nil || snapshot.isNotLooping)
-                let newerLoopRun = (snapshot.loopLastRunAt ?? 0) > (current.loopLastRunAt ?? 0)
-                return completesWatchFetch || newerLoopRun
-            } ?? false
-            guard isNewReading || updatesSameReading else {
-                let task = pendingConnectivityTask
-                pendingConnectivityTask = nil
-                DispatchQueue.main.async { task?.setTaskCompletedWithSnapshot(false) }
+            let (save, isNewReading) = gate(snapshot)
+            guard save else {
+                DispatchQueue.main.async { self.completeHeldTasksIfIdle() }
                 return
             }
             os_log("WatchSessionReceiver: %{public}@ snapshot decoded g=%d, saving", log: watchLog, type: .debug, source, Int(snapshot.glucose))
+            beginSave()
             GlucoseSnapshotStore.shared.save(snapshot) { [weak self] in
                 os_log("WatchSessionReceiver: %{public}@ snapshot saved, reloading complications", log: watchLog, type: .debug, source)
-                // ACK to iPhone so it can detect missed deliveries.
-                self?.sendAck(for: snapshot)
-                // Capture and clear the pending task before dispatching to main,
-                // then complete it after the timeline reload is requested so watchOS
-                // doesn't suspend the app before WidgetKit receives it.
-                let task = self?.pendingConnectivityTask
-                self?.pendingConnectivityTask = nil
+                #if DEBUG
+                    // ACK to iPhone so it can detect missed deliveries; a message for every
+                    // reading isn't worth the radio time outside debugging.
+                    self?.sendAck(for: snapshot)
+                #endif
                 DispatchQueue.main.async { [weak self] in
                     ChannelDiagnosticsStore.shared.record(.phonePush)
                     if isNewReading {
                         self?.reloadComplicationsOnMainThread()
                     }
-                    // Complete background task only after reloadTimeline() has been called.
-                    task?.setTaskCompletedWithSnapshot(false)
+                    // Held wakes end only after reloadTimeline() has been called.
+                    self?.endSave()
                     NotificationCenter.default.post(
                         name: WatchSessionReceiver.snapshotReceivedNotification,
                         object: nil,
@@ -311,7 +364,27 @@ extension WatchSessionReceiver: WCSessionDelegate {
             }
         } catch {
             os_log("WatchSessionReceiver: %{public}@ decode failed — %{public}@", log: watchLog, type: .error, source, error.localizedDescription)
+            DispatchQueue.main.async { self.completeHeldTasksIfIdle() }
         }
+    }
+
+    /// Whether a snapshot from the phone is worth saving, and whether it is a new reading. Only
+    /// a new reading reloads complications, which have a daily budget.
+    private func gate(_ snapshot: GlucoseSnapshot) -> (save: Bool, isNewReading: Bool) {
+        if ComplicationRefreshCounter.shared.shouldReloadAndRecord(for: snapshot) {
+            return (true, true)
+        }
+        // Nothing stored to compare with: any reading beats none.
+        guard let current = GlucoseSnapshotStore.shared.load() else { return (true, true) }
+        // The same reading may still bring news worth showing: the phone's copy of a reading the
+        // Watch fetched itself (BG only) adds IOB, COB and loop state, and a later loop run
+        // (after a bolus or carbs, or a refresh) updates them. Strictly newer only, so an older
+        // copy arriving late on another channel can't undo it.
+        guard current.updatedAt == snapshot.updatedAt else { return (false, false) }
+        let completesWatchFetch = current.iob == nil && current.loopLastRunAt == nil
+            && (snapshot.iob != nil || snapshot.loopLastRunAt != nil || snapshot.isNotLooping)
+        let newerLoopRun = (snapshot.loopLastRunAt ?? 0) > (current.loopLastRunAt ?? 0)
+        return (completesWatchFetch || newerLoopRun, false)
     }
 
     private func showLoopReturnConfirmation(title: String, body: String) {
@@ -332,17 +405,19 @@ extension WatchSessionReceiver: WCSessionDelegate {
         os_log("WatchSessionReceiver: Loop return confirmation shown — %{public}@", log: watchLog, type: .info, title)
     }
 
-    private func sendAck(for snapshot: GlucoseSnapshot) {
-        let session = WCSession.default
-        guard session.activationState == .activated else { return }
-        let ack: [String: Any] = ["watchAck": snapshot.updatedAt.timeIntervalSince1970]
-        if session.isReachable {
-            session.sendMessage(ack, replyHandler: nil, errorHandler: nil)
-        } else {
-            session.transferUserInfo(ack)
+    #if DEBUG
+        private func sendAck(for snapshot: GlucoseSnapshot) {
+            let session = WCSession.default
+            guard session.activationState == .activated else { return }
+            let ack: [String: Any] = ["watchAck": snapshot.updatedAt.timeIntervalSince1970]
+            if session.isReachable {
+                session.sendMessage(ack, replyHandler: nil, errorHandler: nil)
+            } else {
+                session.transferUserInfo(ack)
+            }
+            os_log("WatchSessionReceiver: ACK sent for snapshot at %f", log: watchLog, type: .debug, snapshot.updatedAt.timeIntervalSince1970)
         }
-        os_log("WatchSessionReceiver: ACK sent for snapshot at %f", log: watchLog, type: .debug, snapshot.updatedAt.timeIntervalSince1970)
-    }
+    #endif
 
     /// Asks WidgetKit to rebuild the complication timelines from the App Group store.
     /// May be called from any thread.

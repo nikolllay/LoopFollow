@@ -77,7 +77,8 @@ struct ContentView: View {
                 points: model.history,
                 treatments: model.treatments,
                 treatmentsAsOf: model.treatmentsAsOf,
-                unit: model.snapshot?.unit ?? .mgdl
+                unit: model.snapshot?.unit ?? .mgdl,
+                colors: model.bgColors
             )
             .tag(1)
 
@@ -153,17 +154,27 @@ final class WatchViewModel: ObservableObject {
     @Published var treatmentsAsOf: TimeInterval? = WatchTreatmentHistory.load()?.asOf
     @Published var stats: WatchStatsSummary? = WatchStatsSummary.load()
     @Published var isRefreshing = false
+    /// How BG is colored; kept here so the pages don't read settings on every draw.
+    @Published var bgColors = GlucoseColor.Scheme.current()
 
     private var timer: Timer?
     private var notificationObserver: Any?
     private var snoozeSheetObserver: Any?
     private var settingsObserver: Any?
+    private var appSettingsObserver: AnyCancellable?
 
     init() {
         snapshot = GlucoseSnapshotStore.shared.load()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        // Nothing here needs the exact second; let watchOS fold this wake in with others.
+        timer?.tolerance = 10
+        // The Dynamic BG color switch is in the Watch's own settings. Picked up on the next
+        // turn of the main queue, once the new value is stored.
+        appSettingsObserver = WatchAppSettings.shared.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refresh() }
         notificationObserver = NotificationCenter.default.addObserver(
             forName: WatchSessionReceiver.snapshotReceivedNotification,
             object: nil,
@@ -220,29 +231,38 @@ final class WatchViewModel: ObservableObject {
 
     func refresh() {
         if let loaded = GlucoseSnapshotStore.shared.load() {
-            snapshot = loaded
+            setIfChanged(\.snapshot, loaded)
         }
-        selectedSlots = LAAppGroupSettings.watchSelectedSlots()
-        isSnoozed = WatchAlertManager.shared.isGloballySnoozed
-        snoozeUntil = WatchAlertManager.shared.globalSnoozeExpiryDate
-        hasActiveAlert = snapshot.map { WatchAlertManager.shared.hasActiveAlert(for: $0) } ?? false
-        remoteEnabled = LAAppGroupSettings.isWatchRemoteEnabled()
-        history = WatchGlucoseHistory.load()?.points ?? []
-        let treatmentHistory = WatchTreatmentHistory.load()
-        treatments = treatmentHistory?.treatments ?? []
-        treatmentsAsOf = treatmentHistory?.asOf
-        stats = WatchStatsSummary.load()
+        setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
+        setIfChanged(\.isSnoozed, WatchAlertManager.shared.isGloballySnoozed)
+        setIfChanged(\.snoozeUntil, WatchAlertManager.shared.globalSnoozeExpiryDate)
+        setIfChanged(\.hasActiveAlert, snapshot.map { WatchAlertManager.shared.hasActiveAlert(for: $0) } ?? false)
+        setIfChanged(\.remoteEnabled, LAAppGroupSettings.isWatchRemoteEnabled())
+        setIfChanged(\.bgColors, GlucoseColor.Scheme.current())
+        loadHistories()
     }
 
     func update(snapshot: GlucoseSnapshot) {
-        self.snapshot = snapshot
-        selectedSlots = LAAppGroupSettings.watchSelectedSlots()
-        hasActiveAlert = WatchAlertManager.shared.hasActiveAlert(for: snapshot)
-        history = WatchGlucoseHistory.load()?.points ?? []
+        setIfChanged(\.snapshot, snapshot)
+        setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
+        setIfChanged(\.hasActiveAlert, WatchAlertManager.shared.hasActiveAlert(for: snapshot))
+        loadHistories()
+    }
+
+    private func loadHistories() {
+        setIfChanged(\.history, WatchGlucoseHistory.load()?.points ?? [])
         let treatmentHistory = WatchTreatmentHistory.load()
-        treatments = treatmentHistory?.treatments ?? []
-        treatmentsAsOf = treatmentHistory?.asOf
-        stats = WatchStatsSummary.load()
+        setIfChanged(\.treatments, treatmentHistory?.treatments ?? [])
+        setIfChanged(\.treatmentsAsOf, treatmentHistory?.asOf)
+        setIfChanged(\.stats, WatchStatsSummary.load())
+    }
+
+    /// Every assignment to a published value redraws the pages, the graph included, while the
+    /// timer and notifications mostly bring nothing new; so only real changes are assigned.
+    private func setIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<WatchViewModel, Value>, _ value: Value) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
+        }
     }
 
     /// Slots grouped into pages of 4 for the swipable grid tabs.
@@ -272,79 +292,159 @@ final class WatchViewModel: ObservableObject {
 struct GlucoseView: View {
     @ObservedObject var model: WatchViewModel
 
-    fileprivate static let staleThreshold: TimeInterval = 15 * 60
     /// The settings, remote and refresh icons in the top-right column.
     static let iconSize: CGFloat = 18
     static let iconFrame: CGFloat = 34
-    private static let infoFontSize: CGFloat = 16
 
-    private func infoLine(_ text: String, color: Color = .white) -> some View {
-        Text(text)
+    var body: some View {
+        Group {
+            if let s = model.snapshot {
+                let bgColor = model.bgColors.color(forMgdl: s.glucose)
+                // Ticks every second so the counter's color, and the switch to "--" once the
+                // reading is too old, land on time. A tick only works out the freshness; the page
+                // redraws when that, the reading or its color changes. An explicit schedule for
+                // just those moments didn't fire reliably on watchOS.
+                TimelineView(.periodic(from: s.updatedAt, by: 1)) { context in
+                    let age = max(context.date, Date()).timeIntervalSince(s.updatedAt)
+                    GlucoseReadingView(snapshot: s, freshness: GlucoseFreshness(age: age), bgColor: bgColor)
+                        .equatable()
+                }
+            } else {
+                GlucosePlaceholder(caption: Text("No data").font(.caption).foregroundColor(.secondary))
+            }
+        }
+        .sheet(isPresented: $model.showSnoozeSheet, onDismiss: { model.refresh() }) {
+            SnoozeView(isPresented: $model.showSnoozeSheet, alertType: model.pendingSnoozeType)
+        }
+    }
+}
+
+/// How old the reading is. The "Updated" counter is green, then yellow, then red, when the page
+/// stops showing the number.
+private enum GlucoseFreshness {
+    case fresh, aging, stale
+
+    /// Readings come every 5 minutes.
+    static let agingAfter: TimeInterval = 5 * 60
+    /// Too old to show.
+    static let staleAfter: TimeInterval = 15 * 60
+
+    init(age: TimeInterval) {
+        self = age < Self.agingAfter ? .fresh : age < Self.staleAfter ? .aging : .stale
+    }
+
+    var color: Color {
+        switch self {
+        case .fresh: return .green
+        case .aging: return .yellow
+        case .stale: return .red
+        }
+    }
+}
+
+/// The glucose page for one reading. Equatable, so the once-a-second tick only redraws it when
+/// the reading, its freshness or its color changes.
+private struct GlucoseReadingView: View, Equatable {
+    let snapshot: GlucoseSnapshot
+    let freshness: GlucoseFreshness
+    let bgColor: Color
+
+    private static let infoFontSize: CGFloat = 20
+
+    var body: some View {
+        if freshness == .stale {
+            GlucosePlaceholder(caption: updatedCounter)
+        } else {
+            reading
+        }
+    }
+
+    private func infoRow(_ text: Text, color: Color = .white) -> some View {
+        text
             .font(.system(size: Self.infoFontSize))
             .foregroundColor(color)
             .lineLimit(1)
             .minimumScaleFactor(0.7)
     }
 
-    var body: some View {
-        Group {
-            if let s = model.snapshot, s.age < GlucoseView.staleThreshold {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("\(WatchFormat.glucose(s)) \(WatchFormat.trendArrow(s))")
-                        .font(.system(size: 56, weight: .bold, design: .rounded))
-                        .minimumScaleFactor(0.4)
-                        .lineLimit(1)
-                        .foregroundColor(GlucoseColor.color(forMgdl: s.glucose))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+    /// IOB in yellow and COB in purple, sharing a row; whichever is known.
+    private var insulinAndCarbs: Text? {
+        let s = snapshot
+        let iob = s.iob.map { _ in Text("IOB \(WatchFormat.iob(s)) U").foregroundColor(.yellow) }
+        let cob = s.cob.map { _ in Text("COB \(WatchFormat.cob(s)) g").foregroundColor(.purple) }
+        switch (iob, cob) {
+        case let (iob?, cob?): return Text("\(iob)  \(cob)")
+        case let (iob?, nil): return iob
+        case let (nil, cob?): return cob
+        case (nil, nil): return nil
+        }
+    }
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        infoLine("Delta: \(WatchFormat.delta(s)) \(s.unit.displayName)")
+    /// Time since the reading, counting up every second; it starts again from 0:00 when a new
+    /// reading arrives, so a missed reading shows as 6:34, 6:35…
+    private var updatedCounter: some View {
+        Text("Updated \(Text(snapshot.updatedAt, style: .timer)) ago")
+            .font(.system(size: Self.infoFontSize))
+            .monospacedDigit()
+            .foregroundColor(freshness.color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
 
-                        if s.iob != nil {
-                            infoLine("IOB: \(WatchFormat.iob(s)) U", color: .yellow)
-                        }
+    private var reading: some View {
+        let s = snapshot
+        // Compact rows keep the BG number at full size on the fixed-height page.
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("\(WatchFormat.glucose(s)) \(WatchFormat.trendArrow(s))")
+                .font(.system(size: 56, weight: .bold, design: .rounded))
+                .minimumScaleFactor(0.4)
+                .lineLimit(1)
+                .foregroundColor(bgColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Digits and arrows have no descenders; drop most of the empty space below them.
+                .padding(.bottom, -4)
 
-                        if !s.basalRate.isEmpty {
-                            infoLine("Basal: \(WatchFormat.basal(s)) U/h", color: .blue)
-                        }
+            VStack(alignment: .leading, spacing: 0) {
+                infoRow(s.projected != nil
+                    ? Text("Δ \(WatchFormat.delta(s))   Proj \(WatchFormat.projected(s))")
+                    : Text("Δ \(WatchFormat.delta(s))"))
 
-                        if s.projected != nil {
-                            infoLine("Projected: \(WatchFormat.projected(s)) \(s.unit.displayName)")
-                        }
-
-                        // Time since the reading, counting up every second; it starts again from
-                        // 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35…
-                        Text("Last update: \(Text(s.updatedAt, style: .timer)) ago")
-                            .font(.system(size: Self.infoFontSize))
-                            .monospacedDigit()
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
-
-                        if s.isNotLooping {
-                            infoLine("⚠ Loop inactive", color: .yellow)
-                        }
-                    }
+                if let insulinAndCarbs {
+                    infoRow(insulinAndCarbs)
                 }
-                .padding(.leading, 4)
-                // Keep clear of the icon column on the right.
-                .padding(.trailing, Self.iconFrame)
-            } else {
-                VStack(spacing: 4) {
-                    Text("--")
-                        .font(.system(size: 44, weight: .semibold, design: .rounded))
-                        .foregroundColor(.secondary)
-                    Text(model.snapshot == nil ? "No data" : "Stale")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+
+                if !s.basalRate.isEmpty {
+                    infoRow(Text("Basal \(WatchFormat.basal(s)) U/h"), color: .blue)
                 }
-                // Fill the page so the icon column sits in the corner, not over the placeholder.
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                updatedCounter
+
+                if s.isNotLooping {
+                    infoRow(Text("⚠ Loop inactive"), color: .yellow)
+                }
             }
         }
-        .sheet(isPresented: $model.showSnoozeSheet, onDismiss: { model.refresh() }) {
-            SnoozeView(isPresented: $model.showSnoozeSheet, alertType: model.pendingSnoozeType)
+        .padding(.leading, 4)
+        // Keep clear of the icon column on the right.
+        .padding(.trailing, GlucoseView.iconFrame)
+    }
+}
+
+/// "--" with a caption under it, in the middle of the page.
+private struct GlucosePlaceholder<Caption: View>: View {
+    let caption: Caption
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text("--")
+                .font(.system(size: 44, weight: .semibold, design: .rounded))
+                .foregroundColor(.secondary)
+            caption
         }
+        // Keep the caption clear of the icon column on the right; equal on the left keeps it centered.
+        .padding(.horizontal, GlucoseView.iconFrame)
+        // Fill the page so the icon column sits in the corner, not over the placeholder.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

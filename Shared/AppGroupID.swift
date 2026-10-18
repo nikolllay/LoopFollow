@@ -46,8 +46,12 @@ enum AppGroupID {
     }
 
     static func current() -> String {
-        "group.\(baseBundleID)"
+        resolved
     }
+
+    /// Worked out once: the bundle can't change while the app runs, and settings reads ask for
+    /// the group all the time.
+    private static let resolved = "group.\(baseBundleID)"
 
     /// Strips extension suffixes repeatedly and case-insensitively, so nested bundle IDs
     /// such as `<app>.watchkitapp.widgets` resolve to the app's group.

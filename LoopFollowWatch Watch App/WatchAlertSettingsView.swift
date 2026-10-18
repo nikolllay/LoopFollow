@@ -3,8 +3,8 @@
 
 import SwiftUI
 
-/// The Watch's settings: display options only. The Watch's own alerts run on their
-/// defaults and are snoozed from the alert itself.
+/// The Watch's settings: display options and the delivery diagnostics. The Watch's own
+/// alerts run on their defaults and are snoozed from the alert itself.
 struct WatchAlertSettingsView: View {
     @StateObject private var settings = WatchAppSettings.shared
     @ObservedObject var model: WatchViewModel
@@ -20,6 +20,12 @@ struct WatchAlertSettingsView: View {
                     get: { settings.dynamicBGColor },
                     set: { settings.dynamicBGColor = $0 }
                 ))
+            }
+
+            Section {
+                NavigationLink("Debug") {
+                    DiagnosticsView()
+                }
             }
         }
         .navigationTitle("Settings")
