@@ -212,12 +212,20 @@ struct WatchBolusCommandView: View {
     }
 
     private func sendBolus(units: Double) {
-        guard WCSession.default.isReachable else {
-            alertMessage = "Phone not reachable. Bring your iPhone closer."
-            showAlert = true
-            return
-        }
         isSending = true
+        // Coming back from the passcode prompt, the phone can read as unreachable for a moment.
+        WatchSessionReceiver.shared.whenReachable { reachable in
+            guard reachable else {
+                isSending = false
+                alertMessage = "Phone not reachable. Bring your iPhone closer.\n\nNothing was sent."
+                showAlert = true
+                return
+            }
+            deliverBolus(units: units)
+        }
+    }
+
+    private func deliverBolus(units: Double) {
         let payload: [String: Any] = ["watchCmd": "bolus", "bolusAmount": units]
         WCSession.default.sendMessage(payload) { reply in
             DispatchQueue.main.async {
@@ -251,10 +259,14 @@ struct WatchBolusCommandView: View {
         } errorHandler: { error in
             DispatchQueue.main.async {
                 isSending = false
-                // The phone may have sent the bolus before the reply was lost. Count it as given
-                // until the loop reports, so the recommendation doesn't invite a second full dose.
+                // Once the message has left, no error proves the bolus wasn't sent: even "not
+                // reachable" can follow the phone taking it. Count it as given until the loop
+                // reports, so the recommendation doesn't invite a second full dose.
                 WatchPendingBolus(units: units, sentAt: Date()).record()
-                alertMessage = "Send error: \(error.localizedDescription)\n\nThe bolus may still have been sent. Check \(remoteSystem.displayName) before trying again."
+                let reason = (error as? WCError)?.code == .notReachable
+                    ? "Lost connection to the phone."
+                    : "Send error: \(error.localizedDescription)"
+                alertMessage = "\(reason)\n\nThe bolus may still have been sent. Check \(remoteSystem.displayName) before trying again."
                 showAlert = true
             }
         }

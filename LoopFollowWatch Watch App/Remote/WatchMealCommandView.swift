@@ -81,6 +81,7 @@ struct WatchMealCommandView: View {
                                     .cornerRadius(10)
                             }
                             .buttonStyle(.plain)
+                            .disabled(isSending)
                         }
                     }
 
@@ -126,13 +127,22 @@ struct WatchMealCommandView: View {
     }
 
     private func sendCarbs(grams: Int) {
-        guard WCSession.default.isReachable else {
-            alertMessage = "Phone not reachable. Bring your iPhone closer."
-            showAlert = true
-            return
-        }
+        // Read at confirmation, like the amount.
+        let absorptionHours = foodPresets[selectedFood].1
         isSending = true
-        let (_, absorptionHours) = foodPresets[selectedFood]
+        // Right after the confirm sheet closes, the phone can read as unreachable for a moment.
+        WatchSessionReceiver.shared.whenReachable { reachable in
+            guard reachable else {
+                isSending = false
+                alertMessage = "Phone not reachable. Bring your iPhone closer.\n\nNothing was sent."
+                showAlert = true
+                return
+            }
+            deliverCarbs(grams: grams, absorptionHours: absorptionHours)
+        }
+    }
+
+    private func deliverCarbs(grams: Int, absorptionHours: Double) {
         let payload: [String: Any] = [
             "watchCmd": "carbs",
             "carbsAmount": Double(grams),
@@ -160,8 +170,11 @@ struct WatchMealCommandView: View {
         } errorHandler: { error in
             DispatchQueue.main.async {
                 isSending = false
-                // The phone may have sent the carbs before the reply was lost.
-                alertMessage = "Send error: \(error.localizedDescription)\n\nThe carbs may still have been sent. Check \(remoteSystem.displayName) before trying again."
+                // Once the message has left, no error proves the carbs weren't sent.
+                let reason = (error as? WCError)?.code == .notReachable
+                    ? "Lost connection to the phone."
+                    : "Send error: \(error.localizedDescription)"
+                alertMessage = "\(reason)\n\nThe carbs may still have been sent. Check \(remoteSystem.displayName) before trying again."
                 showAlert = true
             }
         }

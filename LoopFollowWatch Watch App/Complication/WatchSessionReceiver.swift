@@ -49,6 +49,27 @@ final class WatchSessionReceiver: NSObject {
     func triggerComplicationReload() {
         reloadComplications()
     }
+
+    /// Calls `completion` on the main queue with true once the phone can take a live message,
+    /// or with false after `timeout`. The Watch only counts the phone as reachable while this
+    /// app is in the foreground, so right after a system sheet such as the passcode prompt it
+    /// can read as unreachable for a moment with the phone right next to it.
+    func whenReachable(timeout: TimeInterval = 3, completion: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(timeout)
+        func check() {
+            let session = WCSession.default
+            // Deadline first: if the app was suspended mid-wait, a confirmed command must not
+            // go out minutes later.
+            if Date() >= deadline {
+                completion(false)
+            } else if session.activationState == .activated, session.isReachable {
+                completion(true)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: check)
+            }
+        }
+        DispatchQueue.main.async(execute: check)
+    }
 }
 
 // MARK: - WCSessionDelegate
