@@ -9,12 +9,17 @@ import WatchKit
 
 struct WatchBolusCommandView: View {
     let snapshot: GlucoseSnapshot?
+    /// Closes the remote screens back to the glucose page.
+    let onFinished: () -> Void
 
     @State private var bolusUnits: Double
     @State private var showConfirm = false
     @State private var isSending = false
     @State private var alertMessage = ""
     @State private var showAlert = false
+    /// Set once a bolus has, or may have, gone out: OK then leaves this screen, so it can't be
+    /// sent again by mistake.
+    @State private var closeAfterAlert = false
     @FocusState private var amountFocused: Bool
 
     private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
@@ -46,8 +51,9 @@ struct WatchBolusCommandView: View {
         return mins < 12 ? mins : nil
     }
 
-    init(snapshot: GlucoseSnapshot?) {
+    init(snapshot: GlucoseSnapshot?, onFinished: @escaping () -> Void) {
         self.snapshot = snapshot
+        self.onFinished = onFinished
         let system = LAAppGroupSettings.watchRemoteSystem()
         let step = Self.step(for: system)
         self.step = step
@@ -185,7 +191,9 @@ struct WatchBolusCommandView: View {
             if cleaned != units { bolusUnits = cleaned }
         }
         .alert(alertMessage, isPresented: $showAlert) {
-            Button("OK", role: .cancel) {}
+            Button("OK", role: .cancel) {
+                if closeAfterAlert { onFinished() }
+            }
         }
     }
 
@@ -236,17 +244,20 @@ struct WatchBolusCommandView: View {
                     alertMessage = "OTP code already used. Wait up to 30 seconds and try again."
                     showAlert = true
                 } else if ok {
+                    closeAfterAlert = true
                     WatchPendingBolus(units: units, sentAt: Date()).record()
                     scheduleSuccessNotification(units: units)
                     alertMessage = "Bolus sent! (\(formatted(units))U)"
                     showAlert = true
                 } else if reply["alreadySent"] as? Bool == true {
                     // The phone refused a repeat of a bolus that may already have gone out.
+                    closeAfterAlert = true
                     WatchPendingBolus(units: units, sentAt: Date()).recordUnlessPending()
                     alertMessage = reply["error"] as? String ?? "Failed to send bolus"
                     showAlert = true
                 } else if reply["maybeSent"] as? Bool == true {
                     // The connection failed after the phone sent it; Trio may have it.
+                    closeAfterAlert = true
                     WatchPendingBolus(units: units, sentAt: Date()).record()
                     let error = reply["error"] as? String ?? "Send failed"
                     alertMessage = "\(error)\n\nThe bolus may still have been sent. Check \(remoteSystem.displayName) before trying again."
@@ -262,6 +273,7 @@ struct WatchBolusCommandView: View {
                 // Once the message has left, no error proves the bolus wasn't sent: even "not
                 // reachable" can follow the phone taking it. Count it as given until the loop
                 // reports, so the recommendation doesn't invite a second full dose.
+                closeAfterAlert = true
                 WatchPendingBolus(units: units, sentAt: Date()).record()
                 let reason = (error as? WCError)?.code == .notReachable
                     ? "Lost connection to the phone."

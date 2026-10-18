@@ -5,11 +5,13 @@ import SwiftUI
 
 struct WatchRemoteCommandsView: View {
     let snapshot: GlucoseSnapshot?
+    /// Closes the remote screens; called once a command has gone out.
+    let onFinished: () -> Void
 
     var body: some View {
         List {
             NavigationLink {
-                WatchMealCommandView()
+                WatchMealCommandView(onFinished: onFinished)
             } label: {
                 Label("Meal", systemImage: "fork.knife")
             }
@@ -24,7 +26,7 @@ struct WatchRemoteCommandsView: View {
             }
 
             NavigationLink {
-                WatchBolusCommandView(snapshot: snapshot)
+                WatchBolusCommandView(snapshot: snapshot, onFinished: onFinished)
             } label: {
                 Label("Bolus", systemImage: "syringe")
             }

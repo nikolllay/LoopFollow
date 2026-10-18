@@ -22,13 +22,13 @@ struct ContentView: View {
             GlucoseView(model: model)
                 .tag(0)
                 .overlay(alignment: .topTrailing) {
-                    // Spaced apart with larger tap areas so the two small icons are hard to mix up.
+                    // Spaced apart with large tap areas so the icons are easy to hit and hard to mix up.
                     VStack(spacing: 12) {
                         Button { showSettings = true } label: {
                             Image(systemName: "gear")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: GlucoseView.iconSize, weight: .medium))
                                 .foregroundColor(.secondary)
-                                .frame(width: 28, height: 28)
+                                .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -37,9 +37,9 @@ struct ContentView: View {
                         if model.remoteEnabled {
                             Button { showRemote = true } label: {
                                 Image(systemName: "antenna.radiowaves.left.and.right")
-                                    .font(.system(size: 14, weight: .medium))
+                                    .font(.system(size: GlucoseView.iconSize, weight: .medium))
                                     .foregroundColor(.secondary)
-                                    .frame(width: 28, height: 28)
+                                    .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
@@ -51,14 +51,14 @@ struct ContentView: View {
                             Group {
                                 if model.isRefreshing {
                                     ProgressView()
-                                        .scaleEffect(0.6)
+                                        .scaleEffect(0.7)
                                 } else {
                                     Image(systemName: "arrow.clockwise")
-                                        .font(.system(size: 14, weight: .medium))
+                                        .font(.system(size: GlucoseView.iconSize, weight: .medium))
                                         .foregroundColor(.secondary)
                                 }
                             }
-                            .frame(width: 28, height: 28)
+                            .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -67,7 +67,7 @@ struct ContentView: View {
                     }
                 }
                 .sheet(isPresented: $showRemote) {
-                    NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot) }
+                    NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot, onFinished: closeRemote) }
                 }
                 .sheet(isPresented: $showSettings) {
                     NavigationStack { WatchAlertSettingsView(model: model) }
@@ -122,10 +122,18 @@ extension ContentView {
     @ViewBuilder
     private func remoteView(for link: WatchDeepLink) -> some View {
         switch link {
-        case .bolus: WatchBolusCommandView(snapshot: model.snapshot)
-        case .meal: WatchMealCommandView()
+        case .bolus: WatchBolusCommandView(snapshot: model.snapshot, onFinished: closeRemote)
+        case .meal: WatchMealCommandView(onFinished: closeRemote)
         case .override: WatchOverridePickerView()
         }
+    }
+
+    /// Closes the remote screens and shows the glucose page, so after a command has gone out
+    /// the send button is out of reach.
+    private func closeRemote() {
+        showRemote = false
+        deepLink = nil
+        page = 0
     }
 }
 
@@ -265,6 +273,18 @@ struct GlucoseView: View {
     @ObservedObject var model: WatchViewModel
 
     fileprivate static let staleThreshold: TimeInterval = 15 * 60
+    /// The settings, remote and refresh icons in the top-right column.
+    static let iconSize: CGFloat = 18
+    static let iconFrame: CGFloat = 34
+    private static let infoFontSize: CGFloat = 16
+
+    private func infoLine(_ text: String, color: Color = .white) -> some View {
+        Text(text)
+            .font(.system(size: Self.infoFontSize))
+            .foregroundColor(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
 
     var body: some View {
         Group {
@@ -277,57 +297,38 @@ struct GlucoseView: View {
                         .foregroundColor(GlucoseColor.color(forMgdl: s.glucose))
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Delta: \(WatchFormat.delta(s)) \(s.unit.displayName)")
-                            .font(.system(size: 14))
-                            .foregroundColor(.white)
+                    VStack(alignment: .leading, spacing: 2) {
+                        infoLine("Delta: \(WatchFormat.delta(s)) \(s.unit.displayName)")
 
                         if s.iob != nil {
-                            Text("IOB: \(WatchFormat.iob(s)) U")
-                                .font(.system(size: 14))
-                                .foregroundColor(.white)
+                            infoLine("IOB: \(WatchFormat.iob(s)) U", color: .yellow)
+                        }
+
+                        if !s.basalRate.isEmpty {
+                            infoLine("Basal: \(WatchFormat.basal(s)) U/h", color: .blue)
                         }
 
                         if s.projected != nil {
-                            Text("Projected: \(WatchFormat.projected(s)) \(s.unit.displayName)")
-                                .font(.system(size: 14))
-                                .foregroundColor(.white)
+                            infoLine("Projected: \(WatchFormat.projected(s)) \(s.unit.displayName)")
                         }
 
-                        Text("Last update: \(WatchFormat.updateTime(s))")
-                            .font(.system(size: 14))
+                        // Time since the reading, counting up every second; it starts again from
+                        // 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35…
+                        Text("Last update: \(Text(s.updatedAt, style: .timer)) ago")
+                            .font(.system(size: Self.infoFontSize))
+                            .monospacedDigit()
                             .foregroundColor(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
 
                         if s.isNotLooping {
-                            Text("⚠ Loop inactive")
-                                .font(.system(size: 12))
-                                .foregroundColor(.yellow)
-                        }
-                    }
-
-                    VStack(spacing: 6) {
-                        if model.isSnoozed, let until = model.snoozeUntil {
-                            Text("Snoozed until \(until, style: .time)")
-                                .font(.system(size: 11))
-                                .foregroundColor(.orange)
-
-                            Button("Cancel Snooze") {
-                                WatchAlertManager.shared.cancelSnooze(type: nil)
-                                model.refresh()
-                            }
-                            .font(.system(size: 12))
-                            .foregroundColor(.orange)
-                        } else if model.hasActiveAlert {
-                            Button("Snooze…") {
-                                model.pendingSnoozeType = nil
-                                model.showSnoozeSheet = true
-                            }
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
+                            infoLine("⚠ Loop inactive", color: .yellow)
                         }
                     }
                 }
-                .padding(.horizontal, 4)
+                .padding(.leading, 4)
+                // Keep clear of the icon column on the right.
+                .padding(.trailing, Self.iconFrame)
             } else {
                 VStack(spacing: 4) {
                     Text("--")

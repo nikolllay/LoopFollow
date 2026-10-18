@@ -7,6 +7,9 @@ import WatchConnectivity
 import WatchKit
 
 struct WatchMealCommandView: View {
+    /// Closes the remote screens back to the glucose page.
+    let onFinished: () -> Void
+
     // Absorption presets: (emoji, hours)
     private let foodPresets: [(String, Double)] = [("🍭", 0.5), ("🌮", 3.0), ("🍕", 5.0)]
 
@@ -17,7 +20,14 @@ struct WatchMealCommandView: View {
     @State private var alertMessage = ""
     @State private var showAlert = false
     @State private var alertIsSuccess = false
+    /// Set once carbs have, or may have, gone out: OK then leaves this screen, so they can't be
+    /// sent again by mistake.
+    @State private var closeAfterAlert = false
     @FocusState private var amountFocused: Bool
+
+    init(onFinished: @escaping () -> Void) {
+        self.onFinished = onFinished
+    }
 
     private var maxCarbs: Int { max(5, Int(LAAppGroupSettings.watchMaxCarbs())) }
     private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
@@ -122,7 +132,9 @@ struct WatchMealCommandView: View {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
         .alert(alertMessage, isPresented: $showAlert) {
-            Button("OK", role: .cancel) {}
+            Button("OK", role: .cancel) {
+                if closeAfterAlert { onFinished() }
+            }
         }
     }
 
@@ -156,10 +168,16 @@ struct WatchMealCommandView: View {
                 if totpBlocked {
                     alertMessage = "OTP code already used. Wait up to 30 seconds and try again."
                 } else if ok {
+                    closeAfterAlert = true
                     alertMessage = "Carbs sent! (\(grams)g)"
                     scheduleSuccessNotification(grams: grams)
+                } else if reply["alreadySent"] as? Bool == true {
+                    // The phone refused a repeat of carbs that may already have gone out.
+                    closeAfterAlert = true
+                    alertMessage = reply["error"] as? String ?? "Failed to send carbs"
                 } else if reply["maybeSent"] as? Bool == true {
                     // The connection failed after the phone sent it; Trio may have it.
+                    closeAfterAlert = true
                     let error = reply["error"] as? String ?? "Send failed"
                     alertMessage = "\(error)\n\nThe carbs may still have been sent. Check \(remoteSystem.displayName) before trying again."
                 } else {
@@ -171,6 +189,7 @@ struct WatchMealCommandView: View {
             DispatchQueue.main.async {
                 isSending = false
                 // Once the message has left, no error proves the carbs weren't sent.
+                closeAfterAlert = true
                 let reason = (error as? WCError)?.code == .notReachable
                     ? "Lost connection to the phone."
                     : "Send error: \(error.localizedDescription)"
