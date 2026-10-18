@@ -13,10 +13,14 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showRemote = false
     @State private var deepLink: WatchDeepLink?
+    /// The visible page; 0 is the glucose page.
+    @State private var page = 0
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        TabView {
+        TabView(selection: $page) {
             GlucoseView(model: model)
+                .tag(0)
                 .overlay(alignment: .topTrailing) {
                     // Spaced apart with larger tap areas so the two small icons are hard to mix up.
                     VStack(spacing: 12) {
@@ -75,14 +79,24 @@ struct ContentView: View {
                 treatmentsAsOf: model.treatmentsAsOf,
                 unit: model.snapshot?.unit ?? .mgdl
             )
+            .tag(1)
 
             StatsPageView(stats: model.stats, unit: model.snapshot?.unit ?? .mgdl)
+                .tag(2)
 
             ForEach(model.pages.indices, id: \.self) { idx in
                 DataGridPage(slots: model.pages[idx], snapshot: model.snapshot)
+                    .tag(3 + idx)
             }
         }
         .tabViewStyle(.page)
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            // Opening the app starts on the glucose page. Raising the wrist after just lowering
+            // it (inactive, not background) keeps the page you were looking at.
+            if newPhase == .active, oldPhase == .background {
+                page = 0
+            }
+        }
         .sheet(item: $deepLink) { link in
             NavigationStack { remoteView(for: link) }
         }
