@@ -19,7 +19,9 @@ struct WatchSettingsTests {
         nightscoutURL: "https://example.nightscout.test",
         nightscoutToken: "token-123",
         remoteSystem: .trio,
-        bolusIncrement: 0.025
+        bolusIncrement: 0.025,
+        pumpAgeColoring: AgeColoring(warningDays: 3.5, urgentDays: 4),
+        sensorAgeColoring: AgeColoring(warningDays: 9, urgentDays: nil)
     )
 
     @Test("#settings survive the WatchConnectivity encoding")
@@ -35,6 +37,18 @@ struct WatchSettingsTests {
 
         sample.applyToAppGroup()
         #expect(WatchSettings.fromAppGroup() == sample)
+    }
+
+    @Test("#coloring that is off reads back as off")
+    func coloringOff() {
+        let previous = WatchSettings.fromAppGroup()
+        defer { previous.applyToAppGroup() }
+
+        var settings = sample
+        settings.pumpAgeColoring = nil
+        settings.sensorAgeColoring = nil
+        settings.applyToAppGroup()
+        #expect(WatchSettings.fromAppGroup() == settings)
     }
 
     @Test("#a malformed payload is rejected rather than half-applied")

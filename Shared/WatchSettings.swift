@@ -25,6 +25,10 @@ struct WatchSettings: Codable, Equatable {
     var remoteSystem: WatchRemoteSystem = .loop
     /// The pump's bolus increment in units; Trio boluses must be a multiple of it.
     var bolusIncrement: Double = 0.05
+    /// The phone's CAGE and SAGE coloring, which the Watch's pump and sensor ages follow; nil
+    /// while it's off.
+    var pumpAgeColoring: AgeColoring? = nil
+    var sensorAgeColoring: AgeColoring? = nil
 
     func encoded() throws -> Data {
         try JSONEncoder().encode(self)
@@ -45,6 +49,8 @@ struct WatchSettings: Codable, Equatable {
         LAAppGroupSettings.setWatchNightscoutToken(nightscoutToken)
         LAAppGroupSettings.setWatchRemoteSystem(remoteSystem)
         LAAppGroupSettings.setWatchBolusIncrement(bolusIncrement)
+        LAAppGroupSettings.setWatchPumpAgeColoring(pumpAgeColoring)
+        LAAppGroupSettings.setWatchSensorAgeColoring(sensorAgeColoring)
     }
 
     /// Reads the values back from this device's App Group container.
@@ -60,7 +66,9 @@ struct WatchSettings: Codable, Equatable {
             nightscoutURL: LAAppGroupSettings.watchNightscoutURL(),
             nightscoutToken: LAAppGroupSettings.watchNightscoutToken(),
             remoteSystem: LAAppGroupSettings.watchRemoteSystem(),
-            bolusIncrement: LAAppGroupSettings.watchBolusIncrement()
+            bolusIncrement: LAAppGroupSettings.watchBolusIncrement(),
+            pumpAgeColoring: LAAppGroupSettings.watchPumpAgeColoring(),
+            sensorAgeColoring: LAAppGroupSettings.watchSensorAgeColoring()
         )
     }
 }

@@ -23,7 +23,7 @@ struct ContentView: View {
                 .tag(0)
                 .overlay(alignment: .topTrailing) {
                     // Spaced apart with large tap areas so the icons are easy to hit and hard to mix up.
-                    VStack(spacing: 12) {
+                    VStack(spacing: WatchLayout.scaled(12)) {
                         Button { showSettings = true } label: {
                             Image(systemName: "gear")
                                 .font(.system(size: GlucoseView.iconSize, weight: .medium))
@@ -91,6 +91,26 @@ struct ContentView: View {
             }
         }
         .tabViewStyle(.page)
+        // On the glucose page, the pump and sensor ages sit left of the clock, centered in its
+        // row: space the page doesn't otherwise use, whose height differs between watch sizes.
+        .overlay(alignment: .topLeading) {
+            if page == 0 {
+                GeometryReader { geo in
+                    DeviceAgeBadges(
+                        pumpChangedAt: model.snapshot?.cageInsertTime ?? 0,
+                        sensorChangedAt: model.snapshot?.sageInsertTime ?? 0,
+                        pumpColoring: model.pumpAgeColoring,
+                        sensorColoring: model.sensorAgeColoring
+                    )
+                    // Clear of the clock, which takes a little over the right third of the row.
+                    .frame(maxWidth: geo.size.width * 0.6, alignment: .leading)
+                    .frame(height: geo.safeAreaInsets.top)
+                    .padding(.leading, WatchLayout.scaled(16))
+                    .offset(y: -geo.safeAreaInsets.top)
+                }
+                .allowsHitTesting(false)
+            }
+        }
         .onChange(of: scenePhase) { oldPhase, newPhase in
             // Opening the app starts on the glucose page. Raising the wrist after just lowering
             // it (inactive, not background) keeps the page you were looking at.
@@ -156,6 +176,9 @@ final class WatchViewModel: ObservableObject {
     @Published var isRefreshing = false
     /// How BG is colored; kept here so the pages don't read settings on every draw.
     @Published var bgColors = GlucoseColor.Scheme.current()
+    /// The phone's CAGE and SAGE coloring, for the pump and sensor ages.
+    @Published var pumpAgeColoring = LAAppGroupSettings.watchPumpAgeColoring()
+    @Published var sensorAgeColoring = LAAppGroupSettings.watchSensorAgeColoring()
 
     private var timer: Timer?
     private var notificationObserver: Any?
@@ -211,19 +234,24 @@ final class WatchViewModel: ObservableObject {
         if let obs = settingsObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
+    /// Shortest time the refresh spinner shows, so a quick answer still reads as one.
+    private static let minimumSpin: TimeInterval = 0.6
+
     /// The Watch's pull-to-refresh: asks the phone to fetch from Nightscout now, or polls
     /// Nightscout directly when the phone isn't reachable.
     func requestRefresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
         WKInterfaceDevice.current().play(.click)
-        WatchSessionReceiver.shared.requestRefresh { [weak self] phoneIsFetching in
+        let started = Date()
+        WatchSessionReceiver.shared.requestRefresh { [weak self] _ in
             DispatchQueue.main.async {
                 self?.refresh()
-                // The phone sends what it fetched about 8 s later; keep the spinner up until then.
-                DispatchQueue.main.asyncAfter(deadline: .now() + (phoneIsFetching ? 10 : 1.5)) {
+                // The spinner stops once the answer is on screen. What the phone fetches after
+                // its reply arrives on its own a few seconds later and updates the page then.
+                let left = Self.minimumSpin - Date().timeIntervalSince(started)
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0, left)) {
                     self?.isRefreshing = false
-                    self?.refresh()
                 }
             }
         }
@@ -239,6 +267,8 @@ final class WatchViewModel: ObservableObject {
         setIfChanged(\.hasActiveAlert, snapshot.map { WatchAlertManager.shared.hasActiveAlert(for: $0) } ?? false)
         setIfChanged(\.remoteEnabled, LAAppGroupSettings.isWatchRemoteEnabled())
         setIfChanged(\.bgColors, GlucoseColor.Scheme.current())
+        setIfChanged(\.pumpAgeColoring, LAAppGroupSettings.watchPumpAgeColoring())
+        setIfChanged(\.sensorAgeColoring, LAAppGroupSettings.watchSensorAgeColoring())
         loadHistories()
     }
 
@@ -291,22 +321,24 @@ final class WatchViewModel: ObservableObject {
 
 struct GlucoseView: View {
     @ObservedObject var model: WatchViewModel
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     /// The settings, remote and refresh icons in the top-right column.
-    static let iconSize: CGFloat = 18
-    static let iconFrame: CGFloat = 34
+    static let iconSize = WatchLayout.scaled(18)
+    static let iconFrame = WatchLayout.scaled(34)
 
     var body: some View {
         Group {
             if let s = model.snapshot {
                 let bgColor = model.bgColors.color(forMgdl: s.glucose)
+                let textFactor = WatchLayout.textFactor(for: typeSize)
                 // Ticks every second so the counter's color, and the switch to "--" once the
                 // reading is too old, land on time. A tick only works out the freshness; the page
                 // redraws when that, the reading or its color changes. An explicit schedule for
                 // just those moments didn't fire reliably on watchOS.
                 TimelineView(.periodic(from: s.updatedAt, by: 1)) { context in
                     let age = max(context.date, Date()).timeIntervalSince(s.updatedAt)
-                    GlucoseReadingView(snapshot: s, freshness: GlucoseFreshness(age: age), bgColor: bgColor)
+                    GlucoseReadingView(snapshot: s, freshness: GlucoseFreshness(age: age), bgColor: bgColor, textFactor: textFactor)
                         .equatable()
                 }
             } else {
@@ -343,15 +375,20 @@ private enum GlucoseFreshness {
 }
 
 /// The glucose page for one reading. Equatable, so the once-a-second tick only redraws it when
-/// the reading, its freshness or its color changes.
+/// the reading, its freshness or its color changes. Sizes are the 46 mm layout's, scaled to this
+/// screen; the rows' text also follows the watch's Text Size, and the BG number makes room.
 private struct GlucoseReadingView: View, Equatable {
     let snapshot: GlucoseSnapshot
     let freshness: GlucoseFreshness
     let bgColor: Color
+    /// The watch's Text Size, as `WatchLayout.textFactor`.
+    let textFactor: CGFloat
 
-    private static let infoFontSize: CGFloat = 20
+    private var infoFontSize: CGFloat { WatchLayout.scaled(20) * textFactor }
     /// Delta and IOB stand out a little from the rest.
-    private static let emphasisFontSize: CGFloat = 24
+    private var emphasisFontSize: CGFloat { WatchLayout.scaled(24) * textFactor }
+    /// How far a row's text may shrink to fit its width rather than be cut off.
+    private static let minimumScale: CGFloat = 0.6
 
     var body: some View {
         if freshness == .stale {
@@ -363,49 +400,44 @@ private struct GlucoseReadingView: View, Equatable {
 
     private func infoRow(_ text: Text, color: Color = .white) -> some View {
         text
-            .font(.system(size: Self.infoFontSize))
+            .font(.system(size: infoFontSize))
             .foregroundColor(color)
             .lineLimit(1)
-            .minimumScaleFactor(0.7)
+            .minimumScaleFactor(Self.minimumScale)
     }
 
-    /// Delta in larger text, then the projection when there is one. Separate texts, so each keeps
-    /// its own size and only shrinks if the pair doesn't fit.
+    /// Delta in larger text, then the projection when there is one.
     private var deltaAndProjection: some View {
         let s = snapshot
-        return HStack(alignment: .firstTextBaseline, spacing: 12) {
+        return FittedRow(spacing: WatchLayout.scaled(12)) { fit in
             Text("Δ \(WatchFormat.delta(s))")
-                .font(.system(size: Self.emphasisFontSize))
+                .font(.system(size: emphasisFontSize * fit))
             if s.projected != nil {
                 Text("Proj \(WatchFormat.projected(s))")
-                    .font(.system(size: Self.infoFontSize))
+                    .font(.system(size: infoFontSize * fit))
             }
         }
         .foregroundColor(.white)
-        .lineLimit(1)
-        .minimumScaleFactor(0.7)
     }
 
     /// IOB in larger yellow text and COB in purple, side by side; whichever is known. Units sit
-    /// tight against the numbers so the pair fits the row at these sizes.
+    /// tight against the numbers so the pair fits the row.
     @ViewBuilder
     private var insulinAndCarbs: some View {
         let s = snapshot
         if s.iob != nil || s.cob != nil {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+            FittedRow(spacing: WatchLayout.scaled(10)) { fit in
                 if s.iob != nil {
                     Text("IOB \(WatchFormat.iob(s))U")
-                        .font(.system(size: Self.emphasisFontSize))
+                        .font(.system(size: emphasisFontSize * fit))
                         .foregroundColor(.yellow)
                 }
                 if s.cob != nil {
                     Text("COB \(WatchFormat.cob(s))g")
-                        .font(.system(size: Self.infoFontSize))
+                        .font(.system(size: infoFontSize * fit))
                         .foregroundColor(.purple)
                 }
             }
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
         }
     }
 
@@ -413,27 +445,27 @@ private struct GlucoseReadingView: View, Equatable {
     /// reading arrives, so a missed reading shows as 6:34, 6:35…
     private var updatedCounter: some View {
         Text("Updated \(Text(snapshot.updatedAt, style: .timer)) ago")
-            .font(.system(size: Self.infoFontSize))
+            .font(.system(size: infoFontSize))
             .monospacedDigit()
             .foregroundColor(freshness.color)
             .lineLimit(1)
-            .minimumScaleFactor(0.7)
+            .minimumScaleFactor(Self.minimumScale)
     }
 
     private var reading: some View {
         let s = snapshot
         // Compact rows keep the BG number at full size on the fixed-height page.
-        return VStack(alignment: .leading, spacing: 2) {
+        return VStack(alignment: .leading, spacing: WatchLayout.scaled(2)) {
             Text("\(WatchFormat.glucose(s)) \(WatchFormat.trendArrow(s))")
-                .font(.system(size: 56, weight: .bold, design: .rounded))
+                .font(.system(size: WatchLayout.scaled(56), weight: .bold, design: .rounded))
                 .minimumScaleFactor(0.4)
                 .lineLimit(1)
                 .foregroundColor(bgColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 // Digits and arrows sit well inside the font's line: drop the empty space above
                 // them, and most of it below, to leave room for the rows.
-                .padding(.top, -12)
-                .padding(.bottom, -4)
+                .padding(.top, -WatchLayout.scaled(12))
+                .padding(.bottom, -WatchLayout.scaled(4))
 
             VStack(alignment: .leading, spacing: 0) {
                 deltaAndProjection
@@ -454,9 +486,35 @@ private struct GlucoseReadingView: View, Equatable {
             // gives way instead of the rows shrinking unevenly.
             .layoutPriority(1)
         }
-        .padding(.leading, 4)
+        .padding(.leading, WatchLayout.scaled(4))
         // Keep clear of the icon column on the right.
         .padding(.trailing, GlucoseView.iconFrame)
+    }
+}
+
+/// Texts side by side on one line that shrink together when they don't fit at full size, so
+/// neither gets cut off; `content` builds them at a share of their full size.
+private struct FittedRow<Content: View>: View {
+    let spacing: CGFloat
+    @ViewBuilder let content: (CGFloat) -> Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            row(fit: 1).fixedSize()
+            row(fit: 0.9).fixedSize()
+            row(fit: 0.8).fixedSize()
+            row(fit: 0.7).fixedSize()
+            // Very long values: smaller still, cut off only past that.
+            row(fit: 0.6)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+    }
+
+    private func row(fit: CGFloat) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: spacing * fit) {
+            content(fit)
+        }
     }
 }
 
@@ -465,9 +523,9 @@ private struct GlucosePlaceholder<Caption: View>: View {
     let caption: Caption
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: WatchLayout.scaled(4)) {
             Text("--")
-                .font(.system(size: 44, weight: .semibold, design: .rounded))
+                .font(.system(size: WatchLayout.scaled(44), weight: .semibold, design: .rounded))
                 .foregroundColor(.secondary)
             caption
         }

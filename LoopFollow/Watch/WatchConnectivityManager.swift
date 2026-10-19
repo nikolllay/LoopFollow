@@ -73,8 +73,19 @@ final class WatchConnectivityManager: NSObject {
             nightscoutURL: Storage.shared.url.value,
             nightscoutToken: Storage.shared.token.value,
             remoteSystem: remoteSystem ?? .loop,
-            bolusIncrement: Storage.shared.bolusIncrement.value.doubleValue(for: .internationalUnit())
+            bolusIncrement: Storage.shared.bolusIncrement.value.doubleValue(for: .internationalUnit()),
+            pumpAgeColoring: Self.ageColoring(for: .cage),
+            sensorAgeColoring: Self.ageColoring(for: .sage)
         )
+    }
+
+    /// An Info Display row's coloring, which the Watch's pump and sensor ages follow; nil while
+    /// it's off.
+    private static func ageColoring(for type: InfoType) -> AgeColoring? {
+        guard let coloring = Storage.shared.infoDisplayItems.value.item(for: type)?.coloring,
+              coloring.enabled
+        else { return nil }
+        return AgeColoring(warningDays: coloring.warning, urgentDays: coloring.urgent)
     }
 
     private func encode(_ snapshot: GlucoseSnapshot) throws -> Data {
@@ -508,7 +519,8 @@ extension WatchConnectivityManager: WCSessionDelegate {
             Storage.shared.sharedSecret.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.user.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.bundleId.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            Storage.shared.bolusIncrement.$value.dropFirst().map { _ in () }.eraseToAnyPublisher()
+            Storage.shared.bolusIncrement.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.infoDisplayItems.$value.dropFirst().map { _ in () }.eraseToAnyPublisher()
         )
         .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
         .sink { [weak self] in

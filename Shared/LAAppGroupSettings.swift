@@ -192,6 +192,8 @@ enum LAAppGroupSettings {
         static let watchMaxCarbs = "watch.maxCarbs"
         static let watchRemoteSystem = "watch.remoteSystem"
         static let watchBolusIncrement = "watch.bolusIncrement"
+        static let watchPumpAgeColoring = "watch.pumpAgeColoring"
+        static let watchSensorAgeColoring = "watch.sensorAgeColoring"
         static let watchNightscoutURL = "watch.nightscoutURL"
         static let watchNightscoutToken = "watch.nightscoutToken"
     }
@@ -354,6 +356,39 @@ enum LAAppGroupSettings {
     /// The pump's bolus increment in units, as last synced from the phone.
     static func watchBolusIncrement() -> Double {
         defaults?.object(forKey: Keys.watchBolusIncrement) as? Double ?? 0.05
+    }
+
+    // MARK: - Pump and sensor age coloring (Watch)
+
+    static func setWatchPumpAgeColoring(_ coloring: AgeColoring?) {
+        setAgeColoring(coloring, forKey: Keys.watchPumpAgeColoring)
+    }
+
+    /// The phone's CAGE coloring as last synced; nil while it's off.
+    static func watchPumpAgeColoring() -> AgeColoring? {
+        ageColoring(forKey: Keys.watchPumpAgeColoring)
+    }
+
+    static func setWatchSensorAgeColoring(_ coloring: AgeColoring?) {
+        setAgeColoring(coloring, forKey: Keys.watchSensorAgeColoring)
+    }
+
+    /// The phone's SAGE coloring as last synced; nil while it's off.
+    static func watchSensorAgeColoring() -> AgeColoring? {
+        ageColoring(forKey: Keys.watchSensorAgeColoring)
+    }
+
+    private static func setAgeColoring(_ coloring: AgeColoring?, forKey key: String) {
+        if let coloring, let data = try? JSONEncoder().encode(coloring) {
+            defaults?.set(data, forKey: key)
+        } else {
+            defaults?.removeObject(forKey: key)
+        }
+    }
+
+    private static func ageColoring(forKey key: String) -> AgeColoring? {
+        guard let data = defaults?.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(AgeColoring.self, from: data)
     }
 
     // MARK: - NightScout URL and Token (Watch URLSession channel)

@@ -116,7 +116,8 @@ final class WatchNightscoutFetcher: NSObject {
 
             // Rounded like the phone (BGData), so a reading the phone already delivered counts as the same one.
             let updatedAt = Date(timeIntervalSince1970: (entry.date / 1000).rounded(.toNearestOrEven))
-            let unit = resolveUnit()
+            let stored = GlucoseSnapshotStore.shared.load()
+            let unit = stored?.unit ?? .mgdl
             let history = WatchGlucoseHistory.load() ?? WatchGlucoseHistory(points: [])
             // Delta against the previous reading, if it is roughly one CGM interval back.
             let previous = history.points.last { $0.date < updatedAt.timeIntervalSince1970 }
@@ -135,6 +136,10 @@ final class WatchNightscoutFetcher: NSObject {
                 iob: nil,
                 cob: nil,
                 projected: nil,
+                // Site, sensor and insulin changes come from the phone; keep the last ones known.
+                sageInsertTime: stored?.sageInsertTime ?? 0,
+                cageInsertTime: stored?.cageInsertTime ?? 0,
+                iageInsertTime: stored?.iageInsertTime ?? 0,
                 unit: unit,
                 isNotLooping: false
             )
@@ -171,11 +176,6 @@ final class WatchNightscoutFetcher: NSObject {
             )
             completion()
         }
-    }
-
-    private func resolveUnit() -> GlucoseSnapshot.Unit {
-        let stored = GlucoseSnapshotStore.shared.load()
-        return stored?.unit ?? .mgdl
     }
 
     private func trendFromDirection(_ direction: String?) -> GlucoseSnapshot.Trend {
