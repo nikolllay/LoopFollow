@@ -68,6 +68,10 @@ struct StorageCurrentGlucoseStateProvider: CurrentGlucoseStateProviding {
         Observable.shared.deviceBatteryLevel.value
     }
 
+    var batteryIsCharging: Bool? {
+        Observable.shared.deviceBatteryIsCharging.value
+    }
+
     var pumpBattery: Double? {
         Observable.shared.pumpBatteryLevel.value
     }

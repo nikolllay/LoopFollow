@@ -69,6 +69,9 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
     /// CGM/uploader device battery % (nil if not available)
     let battery: Double?
 
+    /// Whether the CGM/uploader device is charging (nil if not reported)
+    let batteryIsCharging: Bool?
+
     /// Pump battery % (nil if not available)
     let pumpBattery: Double?
 
@@ -153,6 +156,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
         tempTargetEndAt: TimeInterval? = nil,
         recBolus: Double? = nil,
         battery: Double? = nil,
+        batteryIsCharging: Bool? = nil,
         pumpBattery: Double? = nil,
         basalRate: String = "",
         pumpReservoirU: Double? = nil,
@@ -187,6 +191,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
         self.tempTargetEndAt = tempTargetEndAt
         self.recBolus = recBolus
         self.battery = battery
+        self.batteryIsCharging = batteryIsCharging
         self.pumpBattery = pumpBattery
         self.basalRate = basalRate
         self.pumpReservoirU = pumpReservoirU
@@ -240,6 +245,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
             tempTargetEndAt: tempTargetEndAt,
             recBolus: recBolus,
             battery: battery,
+            batteryIsCharging: batteryIsCharging,
             pumpBattery: pumpBattery,
             basalRate: basalRate,
             pumpReservoirU: pumpReservoirU,
@@ -280,6 +286,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
         try container.encodeIfPresent(tempTargetEndAt, forKey: .tempTargetEndAt)
         try container.encodeIfPresent(recBolus, forKey: .recBolus)
         try container.encodeIfPresent(battery, forKey: .battery)
+        try container.encodeIfPresent(batteryIsCharging, forKey: .batteryIsCharging)
         try container.encodeIfPresent(pumpBattery, forKey: .pumpBattery)
         try container.encode(basalRate, forKey: .basalRate)
         try container.encodeIfPresent(pumpReservoirU, forKey: .pumpReservoirU)
@@ -317,6 +324,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
         tempTargetEndAt = try container.decodeIfPresent(Double.self, forKey: .tempTargetEndAt)
         recBolus = try container.decodeIfPresent(Double.self, forKey: .recBolus)
         battery = try container.decodeIfPresent(Double.self, forKey: .battery)
+        batteryIsCharging = try container.decodeIfPresent(Bool.self, forKey: .batteryIsCharging)
         pumpBattery = try container.decodeIfPresent(Double.self, forKey: .pumpBattery)
         basalRate = try container.decodeIfPresent(String.self, forKey: .basalRate) ?? ""
         pumpReservoirU = try container.decodeIfPresent(Double.self, forKey: .pumpReservoirU)
@@ -343,7 +351,7 @@ struct GlucoseSnapshot: Codable, Equatable, Hashable {
         case glucose, delta, trend, updatedAt
         case iob, cob, projected
         case override, overrideEndAt, tempTargetMgdl, tempTargetEndAt
-        case recBolus, battery, pumpBattery, basalRate, pumpReservoirU
+        case recBolus, battery, batteryIsCharging, pumpBattery, basalRate, pumpReservoirU
         case autosens, tdd, targetLowMgdl, targetHighMgdl, isfMgdlPerU, carbRatio, carbsToday
         case profileName, sageInsertTime, cageInsertTime, iageInsertTime, minBgMgdl, maxBgMgdl
         case unit, isNotLooping, loopLastRunAt, showRenewalOverlay

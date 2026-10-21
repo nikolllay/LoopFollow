@@ -450,18 +450,33 @@ private struct GlucoseReadingView: View, Equatable {
             .foregroundColor(freshness.color)
     }
 
-    /// The sync counter, then the phone's battery when it's known: red under 20 %.
+    /// The sync counter, then the phone's battery when it's known, red under 20 % and with a bolt
+    /// in place of the battery while charging, as on the phone; then the pump's reservoir.
     private var syncAndBattery: some View {
         let battery = snapshot.battery
         return FittedRow(spacing: WatchLayout.scaled(10)) { fit in
             syncCounter(fit: fit)
             if let battery {
-                (Text(Image(systemName: Self.batterySymbol(battery))) + Text(" \(Int(battery.rounded()))%"))
+                (batteryIcon(battery) + Text(" \(Int(battery.rounded()))%"))
                     .font(.system(size: infoFontSize * fit))
                     .monospacedDigit()
                     .foregroundColor(battery < 20 ? .red : .white)
             }
+            if let reservoir = snapshot.pumpReservoirU {
+                Text("\(Int(reservoir.rounded()))U")
+                    .font(.system(size: infoFontSize * fit))
+                    .monospacedDigit()
+                    .foregroundColor(.white)
+            }
         }
+    }
+
+    /// A green bolt while charging, like the phone's ⚡️; otherwise a battery that empties with the level.
+    private func batteryIcon(_ percent: Double) -> Text {
+        guard snapshot.batteryIsCharging == true else {
+            return Text(Image(systemName: Self.batterySymbol(percent)))
+        }
+        return Text(Image(systemName: "bolt.fill")).foregroundColor(.green)
     }
 
     /// A battery that empties with the level, like the system's.

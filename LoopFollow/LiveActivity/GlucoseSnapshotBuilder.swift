@@ -48,6 +48,9 @@ protocol CurrentGlucoseStateProviding {
     /// CGM/uploader device battery %.
     var battery: Double? { get }
 
+    /// Whether the CGM/uploader device is charging.
+    var batteryIsCharging: Bool? { get }
+
     /// Pump battery %.
     var pumpBattery: Double? { get }
 
@@ -158,6 +161,7 @@ enum GlucoseSnapshotBuilder {
             tempTargetEndAt: provider.tempTargetEndAt,
             recBolus: provider.recBolus,
             battery: provider.battery,
+            batteryIsCharging: provider.batteryIsCharging,
             pumpBattery: provider.pumpBattery,
             basalRate: provider.basalRate,
             pumpReservoirU: provider.pumpReservoirU,
