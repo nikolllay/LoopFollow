@@ -387,6 +387,8 @@ private struct GlucoseReadingView: View, Equatable {
     private var infoFontSize: CGFloat { WatchLayout.scaled(20) * textFactor }
     /// Delta and IOB stand out a little from the rest.
     private var emphasisFontSize: CGFloat { WatchLayout.scaled(24) * textFactor }
+    /// The sync counter, battery and reservoir sit back a little from the rest.
+    private var statusFontSize: CGFloat { WatchLayout.scaled(18) * textFactor }
     /// How far a row's text may shrink to fit its width rather than be cut off.
     private static let minimumScale: CGFloat = 0.6
 
@@ -445,7 +447,7 @@ private struct GlucoseReadingView: View, Equatable {
     /// 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35…
     private func syncCounter(fit: CGFloat = 1) -> Text {
         (Text(Image(systemName: "arrow.triangle.2.circlepath")) + Text(" ") + Text(snapshot.updatedAt, style: .timer))
-            .font(.system(size: infoFontSize * fit))
+            .font(.system(size: statusFontSize * fit))
             .monospacedDigit()
             .foregroundColor(freshness.color)
     }
@@ -458,13 +460,13 @@ private struct GlucoseReadingView: View, Equatable {
             syncCounter(fit: fit)
             if let battery {
                 (batteryIcon(battery) + Text(" \(Int(battery.rounded()))%"))
-                    .font(.system(size: infoFontSize * fit))
+                    .font(.system(size: statusFontSize * fit))
                     .monospacedDigit()
                     .foregroundColor(battery < 20 ? .red : .white)
             }
             if let reservoir = snapshot.pumpReservoirU {
                 Text("\(Int(reservoir.rounded()))U")
-                    .font(.system(size: infoFontSize * fit))
+                    .font(.system(size: statusFontSize * fit))
                     .monospacedDigit()
                     .foregroundColor(.white)
             }
@@ -518,7 +520,9 @@ private struct GlucoseReadingView: View, Equatable {
                     infoRow(Text("Basal \(WatchFormat.basal(s)) U/h"), color: .blue)
                 }
 
+                // Below the icon column, so it can have the page's full width.
                 syncAndBattery
+                    .padding(.trailing, -GlucoseView.iconFrame)
             }
             // The rows get their full height first; when the page runs short, the BG number
             // gives way instead of the rows shrinking unevenly.
