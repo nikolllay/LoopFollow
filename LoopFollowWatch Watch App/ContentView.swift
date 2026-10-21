@@ -351,7 +351,7 @@ struct GlucoseView: View {
     }
 }
 
-/// How old the reading is. The "Updated" counter is green, then yellow, then red, when the page
+/// How old the reading is. The sync counter is green, then yellow, then red, when the page
 /// stops showing the number.
 private enum GlucoseFreshness {
     case fresh, aging, stale
@@ -392,7 +392,7 @@ private struct GlucoseReadingView: View, Equatable {
 
     var body: some View {
         if freshness == .stale {
-            GlucosePlaceholder(caption: updatedCounter)
+            GlucosePlaceholder(caption: syncCounter().lineLimit(1).minimumScaleFactor(Self.minimumScale))
         } else {
             reading
         }
@@ -441,15 +441,38 @@ private struct GlucoseReadingView: View, Equatable {
         }
     }
 
-    /// Time since the reading, counting up every second; it starts again from 0:00 when a new
-    /// reading arrives, so a missed reading shows as 6:34, 6:35…
-    private var updatedCounter: some View {
-        Text("Updated \(Text(snapshot.updatedAt, style: .timer)) ago")
-            .font(.system(size: infoFontSize))
+    /// A sync icon and the time since the reading, counting up every second; it starts again from
+    /// 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35…
+    private func syncCounter(fit: CGFloat = 1) -> Text {
+        (Text(Image(systemName: "arrow.triangle.2.circlepath")) + Text(" ") + Text(snapshot.updatedAt, style: .timer))
+            .font(.system(size: infoFontSize * fit))
             .monospacedDigit()
             .foregroundColor(freshness.color)
-            .lineLimit(1)
-            .minimumScaleFactor(Self.minimumScale)
+    }
+
+    /// The sync counter, then the phone's battery when it's known: red under 20 %.
+    private var syncAndBattery: some View {
+        let battery = snapshot.battery
+        return FittedRow(spacing: WatchLayout.scaled(10)) { fit in
+            syncCounter(fit: fit)
+            if let battery {
+                (Text(Image(systemName: Self.batterySymbol(battery))) + Text(" \(Int(battery.rounded()))%"))
+                    .font(.system(size: infoFontSize * fit))
+                    .monospacedDigit()
+                    .foregroundColor(battery < 20 ? .red : .white)
+            }
+        }
+    }
+
+    /// A battery that empties with the level, like the system's.
+    private static func batterySymbol(_ percent: Double) -> String {
+        switch percent {
+        case ..<13: return "battery.0percent"
+        case ..<38: return "battery.25percent"
+        case ..<63: return "battery.50percent"
+        case ..<88: return "battery.75percent"
+        default: return "battery.100percent"
+        }
     }
 
     private var reading: some View {
@@ -480,7 +503,7 @@ private struct GlucoseReadingView: View, Equatable {
                     infoRow(Text("Basal \(WatchFormat.basal(s)) U/h"), color: .blue)
                 }
 
-                updatedCounter
+                syncAndBattery
             }
             // The rows get their full height first; when the page runs short, the BG number
             // gives way instead of the rows shrinking unevenly.
