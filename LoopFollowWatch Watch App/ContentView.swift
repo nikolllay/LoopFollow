@@ -36,52 +36,6 @@ struct ContentView: View {
         TabView(selection: $page) {
             GlucoseView(model: model)
                 .tag(0)
-                .overlay(alignment: .topTrailing) {
-                    // Spaced apart with large tap areas so the icons are easy to hit and hard to mix up.
-                    VStack(spacing: WatchLayout.scaled(12)) {
-                        Button { sheet = .settings } label: {
-                            Image(systemName: "gear")
-                                .font(.system(size: GlucoseView.iconSize, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Settings")
-
-                        if model.remoteEnabled {
-                            Button { sheet = .remote } label: {
-                                Image(systemName: "antenna.radiowaves.left.and.right")
-                                    .font(.system(size: GlucoseView.iconSize, weight: .medium))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Remote Commands")
-                        }
-
-                        // Fetch the latest data now, like pull-to-refresh on the phone.
-                        Button { model.requestRefresh() } label: {
-                            Group {
-                                if model.isRefreshing {
-                                    ProgressView()
-                                        .scaleEffect(0.7)
-                                } else {
-                                    Image(systemName: "arrow.clockwise")
-                                        .font(.system(size: GlucoseView.iconSize, weight: .medium))
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isRefreshing)
-                        .accessibilityLabel("Refresh")
-                    }
-                }
-
             GlucoseChartView(
                 points: model.history,
                 treatments: model.treatments,
@@ -122,6 +76,26 @@ struct ContentView: View {
                     .accessibilityHint("Shows them larger")
                     .padding(.leading, WatchLayout.scaled(16))
                     .offset(y: -geo.safeAreaInsets.top)
+                }
+            }
+        }
+        // Settings and remote commands in the bottom corners of the glucose page, either side of
+        // the page dots, so every row of the page has its full width.
+        .overlay(alignment: .bottom) {
+            if page == 0 {
+                GeometryReader { geo in
+                    HStack {
+                        cornerButton("gear", label: "Settings") { sheet = .settings }
+                        Spacer()
+                        if model.remoteEnabled {
+                            cornerButton("antenna.radiowaves.left.and.right", label: "Remote Commands") { sheet = .remote }
+                        }
+                    }
+                    // In from the screen's rounded corners.
+                    .padding(.horizontal, WatchLayout.scaled(22))
+                    // Centered in the strip the page dots sit in, below the page.
+                    .frame(width: geo.size.width, height: geo.safeAreaInsets.bottom)
+                    .offset(y: geo.size.height)
                 }
             }
         }
@@ -199,6 +173,20 @@ extension ContentView {
         }
     }
 
+    /// A round button for a bottom corner, like the system's.
+    private func cornerButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: GlucoseView.iconSize, weight: .medium))
+                .foregroundColor(.white)
+                .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
+                .background(Color.white.opacity(0.18), in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
     private var snoozeShown: Binding<Bool> {
         Binding(get: { sheet == .snooze }, set: { if !$0, sheet == .snooze { sheet = nil } })
     }
@@ -229,6 +217,8 @@ final class WatchViewModel: ObservableObject {
     @Published var isRefreshing = false
     /// How BG is colored; kept here so the pages don't read settings on every draw.
     @Published var bgColors = GlucoseColor.Scheme.current()
+    /// The loop's recommended bolus as the Bolus screen offers it; nil when it doesn't.
+    @Published var recommendedBolus: Double?
     /// The phone's CAGE and SAGE coloring, for the pump and sensor ages.
     @Published var pumpAgeColoring = LAAppGroupSettings.watchPumpAgeColoring()
     @Published var sensorAgeColoring = LAAppGroupSettings.watchSensorAgeColoring()
@@ -314,6 +304,8 @@ final class WatchViewModel: ObservableObject {
         if let loaded = GlucoseSnapshotStore.shared.load() {
             setIfChanged(\.snapshot, loaded)
         }
+        // Also after a bolus from the Watch, which the remote screens record as they close.
+        setIfChanged(\.recommendedBolus, snapshot.flatMap(Self.recommendation(for:)))
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
         setIfChanged(\.isSnoozed, WatchAlertManager.shared.isGloballySnoozed)
         setIfChanged(\.snoozeUntil, WatchAlertManager.shared.globalSnoozeExpiryDate)
@@ -327,6 +319,7 @@ final class WatchViewModel: ObservableObject {
 
     func update(snapshot: GlucoseSnapshot) {
         setIfChanged(\.snapshot, snapshot)
+        setIfChanged(\.recommendedBolus, Self.recommendation(for: snapshot))
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
         setIfChanged(\.hasActiveAlert, WatchAlertManager.shared.hasActiveAlert(for: snapshot))
         loadHistories()
@@ -338,6 +331,13 @@ final class WatchViewModel: ObservableObject {
         setIfChanged(\.treatments, treatmentHistory?.treatments ?? [])
         setIfChanged(\.treatmentsAsOf, treatmentHistory?.asOf)
         setIfChanged(\.stats, WatchStatsSummary.load())
+    }
+
+    /// As the Bolus screen offers it: less any Watch bolus the loop hasn't seen yet, and only while
+    /// the loop's last run is recent.
+    private static func recommendation(for snapshot: GlucoseSnapshot) -> Double? {
+        guard WatchBolusCommandView.recommendationAge(of: snapshot) != nil else { return nil }
+        return WatchBolusCommandView.adjustedRecommendation(for: snapshot)
     }
 
     /// Every assignment to a published value redraws the pages, the graph included, while the
@@ -376,14 +376,18 @@ struct GlucoseView: View {
     @ObservedObject var model: WatchViewModel
     @Environment(\.dynamicTypeSize) private var typeSize
 
-    /// The settings, remote and refresh icons in the top-right column.
-    static let iconSize = WatchLayout.scaled(18)
-    static let iconFrame = WatchLayout.scaled(34)
+    /// The settings and remote buttons in the bottom corners.
+    static let iconSize = WatchLayout.scaled(15)
+    static let iconFrame = WatchLayout.scaled(30)
+    /// Room left and right of the page's text, clear of the screen's rounded edge.
+    static let sideMargin = WatchLayout.scaled(10)
 
     var body: some View {
         Group {
             if let s = model.snapshot {
                 let bgColor = model.bgColors.color(forMgdl: s.glucose)
+                // Colored like the BG, so a predicted low or high stands out.
+                let projectedColor = s.projected.map { model.bgColors.color(forMgdl: $0) } ?? .white
                 let textFactor = WatchLayout.textFactor(for: typeSize)
                 // Ticks every second so the counter's color, and the switch to "--" once the
                 // reading is too old, land on time. A tick only works out the freshness; the page
@@ -391,11 +395,28 @@ struct GlucoseView: View {
                 // just those moments didn't fire reliably on watchOS.
                 TimelineView(.periodic(from: s.updatedAt, by: 1)) { context in
                     let age = max(context.date, Date()).timeIntervalSince(s.updatedAt)
-                    GlucoseReadingView(snapshot: s, freshness: GlucoseFreshness(age: age), bgColor: bgColor, textFactor: textFactor)
-                        .equatable()
+                    GlucoseReadingView(
+                        snapshot: s,
+                        freshness: GlucoseFreshness(age: age),
+                        bgColor: bgColor,
+                        projectedColor: projectedColor,
+                        recommendedBolus: model.recommendedBolus,
+                        textFactor: textFactor,
+                        isRefreshing: model.isRefreshing,
+                        onRefresh: model.requestRefresh
+                    )
+                    .equatable()
                 }
             } else {
-                GlucosePlaceholder(caption: Text("No data").font(.caption).foregroundColor(.secondary))
+                // Nothing to count from yet; tapping still fetches.
+                GlucosePlaceholder(caption: Button(action: model.requestRefresh) {
+                    Label("No data", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .symbolEffect(.pulse, isActive: model.isRefreshing)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Refreshes"))
             }
         }
     }
@@ -425,18 +446,29 @@ private enum GlucoseFreshness {
 }
 
 /// The glucose page for one reading. Equatable, so the once-a-second tick only redraws it when
-/// the reading, its freshness or its color changes. Sizes are the 46 mm layout's, scaled to this
+/// the reading, its freshness or its colors change. Sizes are the 46 mm layout's, scaled to this
 /// screen; the rows' text also follows the watch's Text Size, and the BG number makes room.
 private struct GlucoseReadingView: View, Equatable {
     let snapshot: GlucoseSnapshot
     let freshness: GlucoseFreshness
     let bgColor: Color
+    let projectedColor: Color
+    let recommendedBolus: Double?
     /// The watch's Text Size, as `WatchLayout.textFactor`.
     let textFactor: CGFloat
+    let isRefreshing: Bool
+    /// Tapping the sync counter fetches the latest data, like pull-to-refresh on the phone.
+    let onRefresh: () -> Void
+
+    static func == (a: Self, b: Self) -> Bool {
+        a.snapshot == b.snapshot && a.freshness == b.freshness && a.bgColor == b.bgColor
+            && a.projectedColor == b.projectedColor && a.recommendedBolus == b.recommendedBolus
+            && a.textFactor == b.textFactor && a.isRefreshing == b.isRefreshing
+    }
 
     private var infoFontSize: CGFloat { WatchLayout.scaled(20) * textFactor }
     /// Delta and IOB stand out a little from the rest.
-    private var emphasisFontSize: CGFloat { WatchLayout.scaled(24) * textFactor }
+    private var emphasisFontSize: CGFloat { WatchLayout.scaled(22) * textFactor }
     /// The sync counter, battery and reservoir sit back a little from the rest.
     private var statusFontSize: CGFloat { WatchLayout.scaled(18) * textFactor }
     /// How far a row's text may shrink to fit its width rather than be cut off.
@@ -444,9 +476,47 @@ private struct GlucoseReadingView: View, Equatable {
 
     var body: some View {
         if freshness == .stale {
-            GlucosePlaceholder(caption: syncCounter().lineLimit(1).minimumScaleFactor(Self.minimumScale))
+            GlucosePlaceholder(caption: refreshButton(syncCounter().lineLimit(1).minimumScaleFactor(Self.minimumScale)))
         } else {
             reading
+        }
+    }
+
+    /// The BG number and trend, with a recommended bolus beside them. The number keeps its full
+    /// size when there's room, and otherwise gives way, so a recommendation always shows; a wide
+    /// one such as 14.5 ↑↑ comes down to about 80 %. Nothing is shown while the loop recommends none.
+    private var glucoseRow: some View {
+        ViewThatFits(in: .horizontal) {
+            // Under half a hundredth would read as 0.00.
+            if let rec = recommendedBolus, rec >= 0.005 {
+                glucoseAndRecommendation(rec, scale: 1)
+                glucoseAndRecommendation(rec, scale: 0.92)
+                glucoseAndRecommendation(rec, scale: nil)
+            } else {
+                glucoseText(scale: 1)
+            }
+        }
+    }
+
+    private func glucoseText(scale: CGFloat) -> some View {
+        Text("\(WatchFormat.glucose(snapshot)) \(WatchFormat.trendArrow(snapshot))")
+            .font(.system(size: WatchLayout.scaled(56) * scale, weight: .bold, design: .rounded))
+            .minimumScaleFactor(0.4)
+            .lineLimit(1)
+            .foregroundColor(bgColor)
+    }
+
+    /// At `scale`, or with no scale as small as the room beside the recommendation needs.
+    private func glucoseAndRecommendation(_ rec: Double, scale: CGFloat?) -> some View {
+        HStack(spacing: WatchLayout.scaled(4)) {
+            if let scale {
+                glucoseText(scale: scale)
+                    .fixedSize(horizontal: true, vertical: false)
+            } else {
+                glucoseText(scale: 1)
+            }
+            Spacer(minLength: 0)
+            RecommendedBolusBadge(units: rec, textFactor: textFactor)
         }
     }
 
@@ -465,7 +535,7 @@ private struct GlucoseReadingView: View, Equatable {
             Text("Δ \(WatchFormat.delta(s))")
                 .font(.system(size: emphasisFontSize * fit))
             if s.projected != nil {
-                Text("Proj \(WatchFormat.projected(s))")
+                Text("Proj \(Text(WatchFormat.projected(s)).foregroundColor(projectedColor))")
                     .font(.system(size: infoFontSize * fit))
             }
         }
@@ -494,19 +564,34 @@ private struct GlucoseReadingView: View, Equatable {
     }
 
     /// A sync icon and the time since the reading, counting up every second; it starts again from
-    /// 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35…
-    private func syncCounter(fit: CGFloat = 1) -> Text {
-        (Text(Image(systemName: "arrow.triangle.2.circlepath")) + Text(" ") + Text(snapshot.updatedAt, style: .timer))
-            .font(.system(size: statusFontSize * fit))
-            .monospacedDigit()
-            .foregroundColor(freshness.color)
+    /// 0:00 when a new reading arrives, so a missed reading shows as 6:34, 6:35… The icon pulses
+    /// while a refresh is under way.
+    private func syncCounter(fit: CGFloat = 1) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: statusFontSize * fit * 0.25) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .symbolEffect(.pulse, isActive: isRefreshing)
+            Text(snapshot.updatedAt, style: .timer)
+        }
+        .font(.system(size: statusFontSize * fit))
+        .monospacedDigit()
+        .foregroundColor(freshness.color)
+    }
+
+    /// Makes `content` refresh when tapped.
+    private func refreshButton(_ content: some View) -> some View {
+        Button(action: onRefresh) {
+            content.contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRefreshing)
+        .accessibilityHint("Refreshes")
     }
 
     /// The sync counter, then the phone's battery when it's known, red under 20 % and with a bolt
     /// in place of the battery while charging, as on the phone; then the pump's reservoir.
     private var syncAndBattery: some View {
         let battery = snapshot.battery
-        return FittedRow(spacing: WatchLayout.scaled(10)) { fit in
+        return refreshButton(FittedRow(spacing: WatchLayout.scaled(10)) { fit in
             syncCounter(fit: fit)
             if let battery {
                 (batteryIcon(battery) + Text(" \(Int(battery.rounded()))%"))
@@ -521,6 +606,7 @@ private struct GlucoseReadingView: View, Equatable {
                     .foregroundColor(.white)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading))
     }
 
     /// A green bolt while charging, like the phone's ⚡️; otherwise a battery that empties with the level.
@@ -546,11 +632,7 @@ private struct GlucoseReadingView: View, Equatable {
         let s = snapshot
         // Compact rows keep the BG number at full size on the fixed-height page.
         return VStack(alignment: .leading, spacing: WatchLayout.scaled(2)) {
-            Text("\(WatchFormat.glucose(s)) \(WatchFormat.trendArrow(s))")
-                .font(.system(size: WatchLayout.scaled(56), weight: .bold, design: .rounded))
-                .minimumScaleFactor(0.4)
-                .lineLimit(1)
-                .foregroundColor(bgColor)
+            glucoseRow
                 .frame(maxWidth: .infinity, alignment: .leading)
                 // Digits and arrows sit well inside the font's line: drop the empty space above
                 // them, and most of it below, to leave room for the rows.
@@ -570,17 +652,34 @@ private struct GlucoseReadingView: View, Equatable {
                     infoRow(Text("Basal \(WatchFormat.basal(s)) U/h"), color: .blue)
                 }
 
-                // Below the icon column, so it can have the page's full width.
                 syncAndBattery
-                    .padding(.trailing, -GlucoseView.iconFrame)
             }
             // The rows get their full height first; when the page runs short, the BG number
             // gives way instead of the rows shrinking unevenly.
             .layoutPriority(1)
         }
-        .padding(.leading, WatchLayout.scaled(4))
-        // Keep clear of the icon column on the right.
-        .padding(.trailing, GlucoseView.iconFrame)
+        .padding(.horizontal, GlucoseView.sideMargin)
+    }
+}
+
+/// The loop's recommended bolus, in blue. It only shows while one is recommended, so its
+/// appearing is the signal; it holds still rather than blink like an alarm.
+private struct RecommendedBolusBadge: View {
+    let units: Double
+    let textFactor: CGFloat
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            Text("Rec")
+                .font(.system(size: WatchLayout.scaled(12) * textFactor))
+            Text("\(String(format: "%.2f", units))U")
+                .font(.system(size: WatchLayout.scaled(16) * textFactor, weight: .semibold))
+                .monospacedDigit()
+        }
+        .foregroundColor(.blue)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Recommended bolus \(String(format: "%.2f", units)) units")
     }
 }
 
@@ -621,9 +720,7 @@ private struct GlucosePlaceholder<Caption: View>: View {
                 .foregroundColor(.secondary)
             caption
         }
-        // Keep the caption clear of the icon column on the right; equal on the left keeps it centered.
-        .padding(.horizontal, GlucoseView.iconFrame)
-        // Fill the page so the icon column sits in the corner, not over the placeholder.
+        .padding(.horizontal, GlucoseView.sideMargin)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
