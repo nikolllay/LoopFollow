@@ -61,12 +61,56 @@ struct DeviceAgeBadges: View {
     }
 
     /// Like the phone's Info Display: green, yellow, red with the row's coloring on; plain without.
-    private static func color(_ age: DeviceAge, _ coloring: AgeColoring?) -> Color {
+    static func color(_ age: DeviceAge, _ coloring: AgeColoring?) -> Color {
         guard let coloring else { return .white }
         switch coloring.level(forDays: age.days) {
         case .ok: return .green
         case .warning: return .yellow
         case .urgent: return .red
         }
+    }
+}
+
+/// The pump site's and the sensor's age in large type, for a closer look than the badges beside
+/// the clock allow; opened by tapping them.
+struct DeviceAgeDetailView: View {
+    let pumpChangedAt: TimeInterval
+    let sensorChangedAt: TimeInterval
+    let pumpColoring: AgeColoring?
+    let sensorColoring: AgeColoring?
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    var body: some View {
+        TimelineView(.everyMinute) { context in
+            let now = max(context.date, Date())
+            ScrollView {
+                VStack(alignment: .leading, spacing: WatchLayout.scaled(14)) {
+                    if let pump = DeviceAge(since: pumpChangedAt, now: now) {
+                        row(title: "Pump site", icon: "drop.fill", age: pump, coloring: pumpColoring)
+                    }
+                    if let sensor = DeviceAge(since: sensorChangedAt, now: now) {
+                        row(title: "Sensor", icon: "sensor.tag.radiowaves.forward.fill", age: sensor, coloring: sensorColoring)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private func row(title: String, icon: String, age: DeviceAge, coloring: AgeColoring?) -> some View {
+        let factor = WatchLayout.textFactor(for: typeSize)
+        // All in the age's color, like the badge on the glucose page.
+        return VStack(alignment: .leading, spacing: 0) {
+            Label(title, systemImage: icon)
+                .font(.system(size: WatchLayout.scaled(17) * factor, weight: .semibold, design: .rounded))
+            Text(age.label)
+                .font(.system(size: WatchLayout.scaled(40) * factor, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+        }
+        .foregroundColor(DeviceAgeBadges.color(age, coloring))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title) age \(age.label)")
     }
 }

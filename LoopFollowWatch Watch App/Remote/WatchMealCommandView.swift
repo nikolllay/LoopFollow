@@ -2,12 +2,126 @@
 // WatchMealCommandView.swift
 
 import SwiftUI
-import UserNotifications
-import WatchConnectivity
-import WatchKit
 
+/// Logs a meal. For Trio it has the fields of the phone's Meal screen: carbs, and fat, protein
+/// and a bolus when the phone's remote settings offer them, plus when it was eaten. Loop takes
+/// carbs with an absorption time.
 struct WatchMealCommandView: View {
     /// Closes the remote screens back to the glucose page.
+    let onFinished: () -> Void
+
+    private let options = WatchRemoteOptions()
+
+    var body: some View {
+        if options.system == .trio {
+            TrioMealForm(options: options, onFinished: onFinished)
+        } else {
+            LoopCarbsForm(maxCarbs: Int(options.maxCarbs), onFinished: onFinished)
+        }
+    }
+}
+
+// MARK: - Trio
+
+private struct TrioMealForm: View {
+    let options: WatchRemoteOptions
+    let onFinished: () -> Void
+
+    @State private var carbs = 0.0
+    @State private var fat = 0.0
+    @State private var protein = 0.0
+    @State private var bolus = 0.0
+    /// Minutes from now; 0 is now.
+    @State private var timeOffset = 0.0
+    @State private var command: WatchRemoteCommand?
+
+    private var trio: WatchTrioRemote { options.trio }
+
+    var body: some View {
+        List {
+            WatchAmountRow(title: "Carbs", value: $carbs, range: 0 ... options.maxCarbs, step: 1, format: grams)
+            if trio.mealWithFatProtein {
+                WatchAmountRow(title: "Fat", value: $fat, range: 0 ... max(1, trio.maxFat), step: 1, format: grams)
+                WatchAmountRow(title: "Protein", value: $protein, range: 0 ... max(1, trio.maxProtein), step: 1, format: grams)
+            }
+            if trio.mealWithBolus {
+                WatchAmountRow(title: "Bolus", value: $bolus, range: 0 ... options.maxBolus, step: options.bolusStep, format: units)
+            }
+            WatchAmountRow(
+                title: "Time",
+                value: $timeOffset,
+                range: WatchTrioRemote.mealTimeOffsetRangeMinutes,
+                step: 5,
+                format: Self.time,
+                caption: Self.relative
+            )
+
+            Button {
+                command = makeCommand()
+            } label: {
+                Text("Send Meal")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .listRowBackground(Color.clear)
+            .disabled(carbs == 0 && fat == 0 && protein == 0)
+        }
+        .navigationTitle("Meal")
+        .navigationDestination(isPresented: Binding(get: { command != nil }, set: { if !$0 { command = nil } })) {
+            if let command {
+                WatchCommandSendView(command: command, onFinished: onFinished)
+            }
+        }
+    }
+
+    private func grams(_ value: Double) -> String {
+        "\(Int(value))g"
+    }
+
+    private func units(_ value: Double) -> String {
+        "\(options.insulin(value))U"
+    }
+
+    /// "Now", or the time of day.
+    private static func time(_ offset: Double) -> String {
+        offset == 0 ? "Now" : Date().addingTimeInterval(offset * 60).formatted(date: .omitted, time: .shortened)
+    }
+
+    private static func relative(_ offset: Double) -> String? {
+        if offset == 0 { return nil }
+        let text = WatchFormat.duration(minutes: abs(offset))
+        return offset > 0 ? "in \(text)" : "\(text) ago"
+    }
+
+    private func makeCommand() -> WatchRemoteCommand {
+        let eatenAt = timeOffset == 0 ? nil : Date().addingTimeInterval(timeOffset * 60)
+        var message: [String: Any] = ["watchCmd": "meal", "carbs": carbs, "fat": fat, "protein": protein, "bolus": bolus]
+        var details = [[("carbs", carbs), ("fat", fat), ("protein", protein)]
+            .filter { $0.1 > 0 }
+            .map { "\(Int($0.1))g \($0.0)" }
+            .joined(separator: ", ")]
+        if bolus > 0 { details.append("Bolus \(options.insulin(bolus))U") }
+        if let eatenAt {
+            message["eatenAt"] = eatenAt.timeIntervalSince1970
+            details.append("At \(eatenAt.formatted(date: .omitted, time: .shortened))")
+        }
+        return WatchRemoteCommand(
+            title: "Send meal?",
+            details: details,
+            // As on the phone: Trio logs the meal for its time, but gives the bolus straight away.
+            note: bolus > 0 && eatenAt != nil ? "The bolus is given now" : nil,
+            message: message,
+            insulin: bolus,
+            noun: "meal",
+            sentText: "Meal sent to Trio"
+        )
+    }
+}
+
+// MARK: - Loop
+
+private struct LoopCarbsForm: View {
+    let maxCarbs: Int
     let onFinished: () -> Void
 
     // Absorption presets: (emoji, hours)
@@ -15,23 +129,8 @@ struct WatchMealCommandView: View {
 
     @State private var carbsGrams: Int = 2
     @State private var selectedFood: Int = 1 // default: taco (3 hr)
-    @State private var showConfirm = false
-    @State private var isSending = false
-    @State private var alertMessage = ""
-    @State private var showAlert = false
-    @State private var alertIsSuccess = false
-    /// Set once carbs have, or may have, gone out: OK then leaves this screen, so they can't be
-    /// sent again by mistake.
-    @State private var closeAfterAlert = false
+    @State private var confirming = false
     @FocusState private var amountFocused: Bool
-
-    init(onFinished: @escaping () -> Void) {
-        self.onFinished = onFinished
-    }
-
-    // Read once, not on every turn of the crown.
-    private let maxCarbs = max(5, Int(LAAppGroupSettings.watchMaxCarbs()))
-    private let remoteSystem = LAAppGroupSettings.watchRemoteSystem()
 
     /// The crown works on a Double; it moves carbs in 1g steps, like the buttons.
     private var crownCarbs: Binding<Double> {
@@ -74,143 +173,57 @@ struct WatchMealCommandView: View {
                     }
                 }
 
-                // Trio applies its own absorption, so the selector only applies to Loop.
-                if remoteSystem == .loop {
-                    Divider()
+                Divider()
 
-                    // Food type selector
-                    HStack(spacing: 8) {
-                        ForEach(0 ..< foodPresets.count, id: \.self) { idx in
-                            let (emoji, _) = foodPresets[idx]
-                            Button {
-                                selectedFood = idx
-                            } label: {
-                                Text(emoji)
-                                    .font(.title3)
-                                    .frame(width: 44, height: 44)
-                                    .background(selectedFood == idx ? Color.blue.opacity(0.3) : Color.secondary.opacity(0.15))
-                                    .cornerRadius(10)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(isSending)
+                // Food type selector
+                HStack(spacing: 8) {
+                    ForEach(0 ..< foodPresets.count, id: \.self) { idx in
+                        let (emoji, _) = foodPresets[idx]
+                        Button {
+                            selectedFood = idx
+                        } label: {
+                            Text(emoji)
+                                .font(.title3)
+                                .frame(width: 44, height: 44)
+                                .background(selectedFood == idx ? Color.blue.opacity(0.3) : Color.secondary.opacity(0.15))
+                                .cornerRadius(10)
                         }
+                        .buttonStyle(.plain)
                     }
-
-                    Text("\(Int(foodPresets[selectedFood].1 * 60)) min absorption")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
                 }
 
-                // Send button
+                Text("\(Int(foodPresets[selectedFood].1 * 60)) min absorption")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+
                 Button {
                     // Release the crown so turning it to confirm can't change the amount.
                     amountFocused = false
-                    showConfirm = true
+                    confirming = true
                 } label: {
                     Text("Send Carbs")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isSending || carbsGrams <= 0)
-                .sheet(isPresented: $showConfirm) {
-                    // The amount confirmed here is the amount sent.
-                    let grams = carbsGrams
-                    CrownConfirmView(title: "Send \(grams)g?", detail: "Turn the crown to confirm") {
-                        sendCarbs(grams: grams)
-                    }
-                }
-
-                if isSending {
-                    ProgressView("Sending…")
-                        .font(.caption2)
-                }
+                .disabled(carbsGrams <= 0)
             }
             .padding(.horizontal, 4)
         }
         .navigationTitle("Meal")
-        .onAppear {
-            amountFocused = true
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        .onAppear { amountFocused = true }
+        .navigationDestination(isPresented: $confirming) {
+            // The amount and absorption confirmed are the ones sent.
+            let absorption = foodPresets[selectedFood].1
+            WatchCommandSendView(
+                command: WatchRemoteCommand(
+                    title: "Send \(carbsGrams)g?",
+                    details: ["\(Int(absorption * 60)) min absorption"],
+                    message: ["watchCmd": "carbs", "carbsAmount": Double(carbsGrams), "absorptionTime": absorption],
+                    noun: "carbs",
+                    sentText: "\(carbsGrams)g sent to Loop"
+                ),
+                onFinished: onFinished
+            )
         }
-        .alert(alertMessage, isPresented: $showAlert) {
-            Button("OK", role: .cancel) {
-                if closeAfterAlert { onFinished() }
-            }
-        }
-    }
-
-    private func sendCarbs(grams: Int) {
-        // Read at confirmation, like the amount.
-        let absorptionHours = foodPresets[selectedFood].1
-        isSending = true
-        // Right after the confirm sheet closes, the phone can read as unreachable for a moment.
-        WatchSessionReceiver.shared.whenReachable { reachable in
-            guard reachable else {
-                isSending = false
-                alertMessage = "Phone not reachable. Bring your iPhone closer.\n\nNothing was sent."
-                showAlert = true
-                return
-            }
-            deliverCarbs(grams: grams, absorptionHours: absorptionHours)
-        }
-    }
-
-    private func deliverCarbs(grams: Int, absorptionHours: Double) {
-        let payload: [String: Any] = [
-            "watchCmd": "carbs",
-            "carbsAmount": Double(grams),
-            "absorptionTime": absorptionHours,
-        ]
-        WCSession.default.sendMessage(payload) { reply in
-            DispatchQueue.main.async {
-                isSending = false
-                let ok = reply["success"] as? Bool ?? false
-                let totpBlocked = reply["totpBlocked"] as? Bool ?? false
-                if totpBlocked {
-                    alertMessage = "OTP code already used. Wait up to 30 seconds and try again."
-                } else if ok {
-                    closeAfterAlert = true
-                    alertMessage = "Carbs sent! (\(grams)g)"
-                    scheduleSuccessNotification(grams: grams)
-                } else if reply["alreadySent"] as? Bool == true {
-                    // The phone refused a repeat of carbs that may already have gone out.
-                    closeAfterAlert = true
-                    alertMessage = reply["error"] as? String ?? "Failed to send carbs"
-                } else if reply["maybeSent"] as? Bool == true {
-                    // The connection failed after the phone sent it; Trio may have it.
-                    closeAfterAlert = true
-                    let error = reply["error"] as? String ?? "Send failed"
-                    alertMessage = "\(error)\n\nThe carbs may still have been sent. Check \(remoteSystem.displayName) before trying again."
-                } else {
-                    alertMessage = reply["error"] as? String ?? "Failed to send carbs"
-                }
-                showAlert = true
-            }
-        } errorHandler: { error in
-            DispatchQueue.main.async {
-                isSending = false
-                // Once the message has left, no error proves the carbs weren't sent.
-                closeAfterAlert = true
-                let reason = (error as? WCError)?.code == .notReachable
-                    ? "Lost connection to the phone."
-                    : "Send error: \(error.localizedDescription)"
-                alertMessage = "\(reason)\n\nThe carbs may still have been sent. Check \(remoteSystem.displayName) before trying again."
-                showAlert = true
-            }
-        }
-    }
-
-    private func scheduleSuccessNotification(grams: Int) {
-        WKInterfaceDevice.current().play(.success)
-        let content = UNMutableNotificationContent()
-        content.title = "Carbs Logged ✓"
-        content.body = "\(grams)g sent to \(remoteSystem.displayName)"
-        content.sound = .default
-        let request = UNNotificationRequest(
-            identifier: "carbs-\(UUID().uuidString)",
-            content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-        )
-        UNUserNotificationCenter.current().add(request)
     }
 }

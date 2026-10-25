@@ -182,6 +182,20 @@ enum WatchFormat {
         }
     }
 
+    /// A glucose value held in mg/dL, in the given unit.
+    static func glucose(mgdl: Double, unit: GlucoseSnapshot.Unit) -> String {
+        formatGlucoseValue(mgdl, unit: unit)
+    }
+
+    /// "45 min", "1h", "1h 30m".
+    static func duration(minutes: Double) -> String {
+        let total = Int(minutes.rounded())
+        let h = total / 60
+        let m = total % 60
+        if h == 0 { return "\(m) min" }
+        return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+    }
+
     // MARK: - Private
 
     private static func formatGlucoseValue(_ mgdl: Double, unit: GlucoseSnapshot.Unit) -> String {

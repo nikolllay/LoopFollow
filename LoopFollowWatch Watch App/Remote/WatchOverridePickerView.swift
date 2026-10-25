@@ -2,17 +2,14 @@
 // WatchOverridePickerView.swift
 
 import SwiftUI
-import UserNotifications
-import WatchConnectivity
-import WatchKit
 
+/// Loop's override presets.
 struct WatchOverridePickerView: View {
+    /// Closes the remote screens back to the glucose page.
+    let onFinished: () -> Void
+
     @State private var presets: [WatchOverridePreset] = []
-    @State private var selectedPreset: WatchOverridePreset?
-    @State private var showConfirm = false
-    @State private var isSending = false
-    @State private var alertMessage = ""
-    @State private var showAlert = false
+    @State private var command: WatchRemoteCommand?
 
     var body: some View {
         List {
@@ -23,8 +20,17 @@ struct WatchOverridePickerView: View {
             } else {
                 ForEach(presets) { preset in
                     Button {
-                        selectedPreset = preset
-                        showConfirm = true
+                        command = WatchRemoteCommand(
+                            title: "Activate \(preset.name)?",
+                            details: [preset.durationDescription],
+                            message: [
+                                "watchCmd": "override",
+                                "overrideName": preset.name,
+                                "overrideDuration": preset.durationSeconds,
+                            ],
+                            noun: "override",
+                            sentText: "\(preset.name) sent to Loop"
+                        )
                     } label: {
                         HStack {
                             if let symbol = preset.symbol {
@@ -39,80 +45,21 @@ struct WatchOverridePickerView: View {
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
-                            Spacer()
-                            if isSending && selectedPreset?.name == preset.name {
-                                ProgressView().scaleEffect(0.7)
-                            }
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(isSending)
                 }
             }
         }
         .navigationTitle("Presets")
         .onAppear {
             presets = LAAppGroupSettings.watchOverridePresets()
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
-        .confirmationDialog(
-            selectedPreset.map { "Activate \($0.name)?" } ?? "Activate override?",
-            isPresented: $showConfirm,
-            titleVisibility: .visible
-        ) {
-            if let preset = selectedPreset {
-                Button("Activate") { sendOverride(preset) }
-            }
-            Button("Cancel", role: .cancel) {}
-        }
-        .alert(alertMessage, isPresented: $showAlert) {
-            Button("OK", role: .cancel) {}
-        }
-    }
-
-    private func sendOverride(_ preset: WatchOverridePreset) {
-        guard WCSession.default.isReachable else {
-            alertMessage = "Phone not reachable. Bring your iPhone closer."
-            showAlert = true
-            return
-        }
-        isSending = true
-        let payload: [String: Any] = [
-            "watchCmd": "override",
-            "overrideName": preset.name,
-            "overrideDuration": preset.durationSeconds,
-        ]
-        WCSession.default.sendMessage(payload) { reply in
-            DispatchQueue.main.async {
-                isSending = false
-                let ok = reply["success"] as? Bool ?? false
-                alertMessage = ok
-                    ? "\(preset.name) activated!"
-                    : (reply["error"] as? String ?? "Failed to activate override")
-                if ok { scheduleSuccessNotification(name: preset.name) }
-                showAlert = true
-            }
-        } errorHandler: { error in
-            DispatchQueue.main.async {
-                isSending = false
-                alertMessage = "Send error: \(error.localizedDescription)"
-                showAlert = true
+        .navigationDestination(isPresented: Binding(get: { command != nil }, set: { if !$0 { command = nil } })) {
+            if let command {
+                WatchCommandSendView(command: command, onFinished: onFinished)
             }
         }
-    }
-
-    private func scheduleSuccessNotification(name: String) {
-        WKInterfaceDevice.current().play(.success)
-        let content = UNMutableNotificationContent()
-        content.title = "Override Activated ✓"
-        content.body = "\(name) sent to Loop"
-        content.sound = .default
-        let request = UNNotificationRequest(
-            identifier: "override-\(UUID().uuidString)",
-            content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-        )
-        UNUserNotificationCenter.current().add(request)
     }
 }
 

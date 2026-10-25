@@ -194,6 +194,7 @@ enum LAAppGroupSettings {
         static let watchBolusIncrement = "watch.bolusIncrement"
         static let watchPumpAgeColoring = "watch.pumpAgeColoring"
         static let watchSensorAgeColoring = "watch.sensorAgeColoring"
+        static let watchTrioRemote = "watch.trioRemote"
         static let watchNightscoutURL = "watch.nightscoutURL"
         static let watchNightscoutToken = "watch.nightscoutToken"
     }
@@ -389,6 +390,22 @@ enum LAAppGroupSettings {
     private static func ageColoring(forKey key: String) -> AgeColoring? {
         guard let data = defaults?.data(forKey: key) else { return nil }
         return try? JSONDecoder().decode(AgeColoring.self, from: data)
+    }
+
+    // MARK: - Trio remote (Watch)
+
+    /// The phone's Trio remote options; nil while Watch commands don't go through Trio.
+    static func setWatchTrioRemote(_ remote: WatchTrioRemote?) {
+        if let remote, let data = try? JSONEncoder().encode(remote) {
+            defaults?.set(data, forKey: Keys.watchTrioRemote)
+        } else {
+            defaults?.removeObject(forKey: Keys.watchTrioRemote)
+        }
+    }
+
+    static func watchTrioRemote() -> WatchTrioRemote? {
+        guard let data = defaults?.data(forKey: Keys.watchTrioRemote) else { return nil }
+        return try? JSONDecoder().decode(WatchTrioRemote.self, from: data)
     }
 
     // MARK: - NightScout URL and Token (Watch URLSession channel)

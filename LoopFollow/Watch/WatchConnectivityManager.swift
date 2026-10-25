@@ -75,7 +75,33 @@ final class WatchConnectivityManager: NSObject {
             remoteSystem: remoteSystem ?? .loop,
             bolusIncrement: Storage.shared.bolusIncrement.value.doubleValue(for: .internationalUnit()),
             pumpAgeColoring: Self.ageColoring(for: .cage),
-            sensorAgeColoring: Self.ageColoring(for: .sage)
+            sensorAgeColoring: Self.ageColoring(for: .sage),
+            trioRemote: remoteSystem == .trio ? Self.trioRemote() : nil
+        )
+    }
+
+    /// What the phone's Trio remote screens offer, for the Watch's.
+    private static func trioRemote() -> WatchTrioRemote {
+        WatchTrioRemote(
+            mealWithBolus: Storage.shared.mealWithBolus.value,
+            mealWithFatProtein: Storage.shared.mealWithFatProtein.value,
+            maxFat: Storage.shared.maxFat.value.doubleValue(for: .gram()),
+            maxProtein: Storage.shared.maxProtein.value.doubleValue(for: .gram()),
+            tempTargetPresets: TempTargetPresetManager.shared.presets.map {
+                WatchTrioRemote.TempTargetPreset(
+                    name: $0.name,
+                    targetMgdl: $0.target.doubleValue(for: .milligramsPerDeciliter),
+                    durationMinutes: $0.duration.doubleValue(for: .minute())
+                )
+            },
+            overrides: ProfileManager.shared.trioOverrides.map {
+                WatchTrioRemote.Override(
+                    name: $0.name,
+                    durationMinutes: $0.duration,
+                    percentage: $0.percentage,
+                    targetMgdl: $0.target?.doubleValue(for: .milligramsPerDeciliter)
+                )
+            }
         )
     }
 
@@ -503,7 +529,8 @@ extension WatchConnectivityManager: WCSessionDelegate {
 
     /// Observes the storage values behind `WatchSettings` and pushes them when they change.
     private func observeWatchSettings() {
-        Publishers.MergeMany(
+        // One list, typed up front: as a single expression it is too much for the type checker.
+        let changes: [AnyPublisher<Void, Never>] = [
             Storage.shared.deviceToken.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.loopAPNSQrCodeURL.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.remoteApnsKey.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
@@ -520,12 +547,19 @@ extension WatchConnectivityManager: WCSessionDelegate {
             Storage.shared.user.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.bundleId.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             Storage.shared.bolusIncrement.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            Storage.shared.infoDisplayItems.$value.dropFirst().map { _ in () }.eraseToAnyPublisher()
-        )
-        .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
-        .sink { [weak self] in
-            self?.pushSettingsIfChanged()
-        }
-        .store(in: &cancellables)
+            Storage.shared.infoDisplayItems.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.mealWithBolus.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.mealWithFatProtein.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.maxFat.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.maxProtein.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            // Trio's overrides come with the profile, which pushes the settings itself as it loads.
+            TempTargetPresetManager.shared.$presets.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+        ]
+        Publishers.MergeMany(changes)
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.pushSettingsIfChanged()
+            }
+            .store(in: &cancellables)
     }
 }

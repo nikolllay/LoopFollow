@@ -8,14 +8,29 @@ import WatchKit
 
 // MARK: - Root view
 
+/// What shows over the pages. Only one at a time: watchOS presents one sheet, and asking for a
+/// second while another is up, or while one is closing, can leave a screen that takes no taps.
+private enum RootSheet: Identifiable, Hashable {
+    case settings
+    case remote
+    case deviceAges
+    case snooze
+    /// A shortcut complication's remote screen.
+    case shortcut(WatchDeepLink)
+
+    var id: Self { self }
+}
+
 struct ContentView: View {
     @StateObject private var model = WatchViewModel()
-    @State private var showSettings = false
-    @State private var showRemote = false
-    @State private var deepLink: WatchDeepLink?
+    @State private var sheet: RootSheet?
     /// The visible page; 0 is the glucose page.
     @State private var page = 0
     @Environment(\.scenePhase) private var scenePhase
+
+    /// Last site change and sensor start, Unix epoch seconds; 0 when unknown.
+    private var pumpChangedAt: TimeInterval { model.snapshot?.cageInsertTime ?? 0 }
+    private var sensorChangedAt: TimeInterval { model.snapshot?.sageInsertTime ?? 0 }
 
     var body: some View {
         TabView(selection: $page) {
@@ -24,7 +39,7 @@ struct ContentView: View {
                 .overlay(alignment: .topTrailing) {
                     // Spaced apart with large tap areas so the icons are easy to hit and hard to mix up.
                     VStack(spacing: WatchLayout.scaled(12)) {
-                        Button { showSettings = true } label: {
+                        Button { sheet = .settings } label: {
                             Image(systemName: "gear")
                                 .font(.system(size: GlucoseView.iconSize, weight: .medium))
                                 .foregroundColor(.secondary)
@@ -35,7 +50,7 @@ struct ContentView: View {
                         .accessibilityLabel("Settings")
 
                         if model.remoteEnabled {
-                            Button { showRemote = true } label: {
+                            Button { sheet = .remote } label: {
                                 Image(systemName: "antenna.radiowaves.left.and.right")
                                     .font(.system(size: GlucoseView.iconSize, weight: .medium))
                                     .foregroundColor(.secondary)
@@ -66,12 +81,6 @@ struct ContentView: View {
                         .accessibilityLabel("Refresh")
                     }
                 }
-                .sheet(isPresented: $showRemote) {
-                    NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot, onFinished: closeRemote) }
-                }
-                .sheet(isPresented: $showSettings) {
-                    NavigationStack { WatchAlertSettingsView(model: model) }
-                }
 
             GlucoseChartView(
                 points: model.history,
@@ -93,23 +102,69 @@ struct ContentView: View {
         .tabViewStyle(.page)
         // On the glucose page, the pump and sensor ages sit left of the clock, centered in its
         // row: space the page doesn't otherwise use, whose height differs between watch sizes.
+        // Tapping them shows them larger.
         .overlay(alignment: .topLeading) {
-            if page == 0 {
+            if page == 0, pumpChangedAt > 0 || sensorChangedAt > 0 {
                 GeometryReader { geo in
-                    DeviceAgeBadges(
-                        pumpChangedAt: model.snapshot?.cageInsertTime ?? 0,
-                        sensorChangedAt: model.snapshot?.sageInsertTime ?? 0,
-                        pumpColoring: model.pumpAgeColoring,
-                        sensorColoring: model.sensorAgeColoring
-                    )
-                    // Clear of the clock, which takes a little over the right third of the row.
-                    .frame(maxWidth: geo.size.width * 0.6, alignment: .leading)
-                    .frame(height: geo.safeAreaInsets.top)
+                    Button { sheet = .deviceAges } label: {
+                        DeviceAgeBadges(
+                            pumpChangedAt: pumpChangedAt,
+                            sensorChangedAt: sensorChangedAt,
+                            pumpColoring: model.pumpAgeColoring,
+                            sensorColoring: model.sensorAgeColoring
+                        )
+                        // Clear of the clock, which takes a little over the right third of the row.
+                        .frame(maxWidth: geo.size.width * 0.6, alignment: .leading)
+                        .frame(height: geo.safeAreaInsets.top)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows them larger")
                     .padding(.leading, WatchLayout.scaled(16))
                     .offset(y: -geo.safeAreaInsets.top)
                 }
-                .allowsHitTesting(false)
             }
+        }
+        // Every sheet is presented here, at the root, rather than from inside a page.
+        .sheet(item: $sheet, onDismiss: {
+            // Picks up a snooze just set, among other things.
+            model.refresh()
+            // A snooze asked for while the remote screens were open, now that they've closed.
+            if model.showSnoozeSheet, sheet == nil { sheet = .snooze }
+        }) { shown in
+            switch shown {
+            case .settings:
+                NavigationStack { WatchAlertSettingsView(model: model) }
+            case .remote:
+                NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot, onFinished: closeRemote) }
+            case .deviceAges:
+                NavigationStack {
+                    DeviceAgeDetailView(
+                        pumpChangedAt: pumpChangedAt,
+                        sensorChangedAt: sensorChangedAt,
+                        pumpColoring: model.pumpAgeColoring,
+                        sensorColoring: model.sensorAgeColoring
+                    )
+                }
+            case .snooze:
+                SnoozeView(isPresented: snoozeShown, alertType: model.pendingSnoozeType)
+            case let .shortcut(link):
+                NavigationStack { remoteView(for: link) }
+            }
+        }
+        // An alert's Snooze action asks for the snooze sheet. It takes the place of settings or the
+        // ages, but waits for the remote screens to close, so a command on its way isn't cut off
+        // before its result shows. Checked on appear too, for a Snooze tap that opened the app.
+        .onChange(of: model.showSnoozeSheet, initial: true) { _, show in
+            guard show else { return }
+            switch sheet {
+            case .remote, .shortcut: break
+            default: sheet = .snooze
+            }
+        }
+        .onChange(of: sheet) { old, new in
+            // The snooze sheet has closed, or a shortcut has taken its place.
+            if old == .snooze, new != .snooze { model.showSnoozeSheet = false }
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
             // Opening the app starts on the glucose page. Raising the wrist after just lowering
@@ -118,18 +173,13 @@ struct ContentView: View {
                 page = 0
             }
         }
-        .sheet(item: $deepLink) { link in
-            NavigationStack { remoteView(for: link) }
-        }
         .onOpenURL { url in
             // Shortcut complications land on their remote screen; without remote
             // commands configured they simply open the app.
             guard let link = WatchDeepLink(url: url), LAAppGroupSettings.isWatchRemoteEnabled() else { return }
-            // Override presets are only wired up for Loop.
+            // The override shortcut opens Loop's presets; Trio's overrides are in the remote menu.
             if link == .override, LAAppGroupSettings.watchRemoteSystem() != .loop { return }
-            showRemote = false
-            showSettings = false
-            deepLink = link
+            sheet = .shortcut(link)
         }
         .onAppear {
             model.refresh()
@@ -145,15 +195,18 @@ extension ContentView {
         switch link {
         case .bolus: WatchBolusCommandView(snapshot: model.snapshot, onFinished: closeRemote)
         case .meal: WatchMealCommandView(onFinished: closeRemote)
-        case .override: WatchOverridePickerView()
+        case .override: WatchOverridePickerView(onFinished: closeRemote)
         }
+    }
+
+    private var snoozeShown: Binding<Bool> {
+        Binding(get: { sheet == .snooze }, set: { if !$0, sheet == .snooze { sheet = nil } })
     }
 
     /// Closes the remote screens and shows the glucose page, so after a command has gone out
     /// the send button is out of reach.
     private func closeRemote() {
-        showRemote = false
-        deepLink = nil
+        sheet = nil
         page = 0
     }
 }
@@ -344,9 +397,6 @@ struct GlucoseView: View {
             } else {
                 GlucosePlaceholder(caption: Text("No data").font(.caption).foregroundColor(.secondary))
             }
-        }
-        .sheet(isPresented: $model.showSnoozeSheet, onDismiss: { model.refresh() }) {
-            SnoozeView(isPresented: $model.showSnoozeSheet, alertType: model.pendingSnoozeType)
         }
     }
 }

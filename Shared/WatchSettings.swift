@@ -29,6 +29,8 @@ struct WatchSettings: Codable, Equatable {
     /// while it's off.
     var pumpAgeColoring: AgeColoring? = nil
     var sensorAgeColoring: AgeColoring? = nil
+    /// The phone's Trio remote options; nil while Watch commands don't go through Trio.
+    var trioRemote: WatchTrioRemote? = nil
 
     func encoded() throws -> Data {
         try JSONEncoder().encode(self)
@@ -51,6 +53,7 @@ struct WatchSettings: Codable, Equatable {
         LAAppGroupSettings.setWatchBolusIncrement(bolusIncrement)
         LAAppGroupSettings.setWatchPumpAgeColoring(pumpAgeColoring)
         LAAppGroupSettings.setWatchSensorAgeColoring(sensorAgeColoring)
+        LAAppGroupSettings.setWatchTrioRemote(trioRemote)
     }
 
     /// Reads the values back from this device's App Group container.
@@ -68,7 +71,8 @@ struct WatchSettings: Codable, Equatable {
             remoteSystem: LAAppGroupSettings.watchRemoteSystem(),
             bolusIncrement: LAAppGroupSettings.watchBolusIncrement(),
             pumpAgeColoring: LAAppGroupSettings.watchPumpAgeColoring(),
-            sensorAgeColoring: LAAppGroupSettings.watchSensorAgeColoring()
+            sensorAgeColoring: LAAppGroupSettings.watchSensorAgeColoring(),
+            trioRemote: LAAppGroupSettings.watchTrioRemote()
         )
     }
 }

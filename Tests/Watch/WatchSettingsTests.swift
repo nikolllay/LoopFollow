@@ -21,7 +21,18 @@ struct WatchSettingsTests {
         remoteSystem: .trio,
         bolusIncrement: 0.025,
         pumpAgeColoring: AgeColoring(warningDays: 3.5, urgentDays: 4),
-        sensorAgeColoring: AgeColoring(warningDays: 9, urgentDays: nil)
+        sensorAgeColoring: AgeColoring(warningDays: 9, urgentDays: nil),
+        trioRemote: WatchTrioRemote(
+            mealWithBolus: true,
+            mealWithFatProtein: true,
+            maxFat: 40,
+            maxProtein: 50,
+            tempTargetPresets: [.init(name: "Exercise", targetMgdl: 150, durationMinutes: 60)],
+            overrides: [
+                .init(name: "Sick", durationMinutes: 120, percentage: 120, targetMgdl: 100),
+                .init(name: "Indefinite", durationMinutes: nil, percentage: nil, targetMgdl: nil),
+            ]
+        )
     )
 
     @Test("#settings survive the WatchConnectivity encoding")
@@ -39,7 +50,7 @@ struct WatchSettingsTests {
         #expect(WatchSettings.fromAppGroup() == sample)
     }
 
-    @Test("#coloring that is off reads back as off")
+    @Test("#coloring that is off, and no Trio remote, read back as such")
     func coloringOff() {
         let previous = WatchSettings.fromAppGroup()
         defer { previous.applyToAppGroup() }
@@ -47,8 +58,18 @@ struct WatchSettingsTests {
         var settings = sample
         settings.pumpAgeColoring = nil
         settings.sensorAgeColoring = nil
+        settings.trioRemote = nil
         settings.applyToAppGroup()
         #expect(WatchSettings.fromAppGroup() == settings)
+    }
+
+    @Test("#Trio remote options missing fields read with their defaults")
+    func trioRemoteMissingFields() throws {
+        let decoded = try JSONDecoder().decode(WatchTrioRemote.self, from: Data(#"{"mealWithBolus":true}"#.utf8))
+        #expect(decoded.mealWithBolus)
+        #expect(!decoded.mealWithFatProtein)
+        #expect(decoded.maxFat == 30)
+        #expect(decoded.overrides.isEmpty)
     }
 
     @Test("#a malformed payload is rejected rather than half-applied")
