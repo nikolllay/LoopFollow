@@ -100,4 +100,47 @@ struct WatchRefreshPolicyTests {
     func pushBudgetSpent() {
         #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: .distantPast, remainingTransfers: 0))
     }
+
+    // MARK: - Another copy of the same reading
+
+    private func snapshot(at updatedAt: Date, loopRanAt: Date? = nil, iob: Double? = nil, battery: Double? = nil, recBolus: Double? = nil) -> GlucoseSnapshot {
+        GlucoseSnapshot(
+            glucose: 120, delta: 0, trend: .flat, updatedAt: updatedAt,
+            iob: iob, cob: nil, projected: nil,
+            recBolus: recBolus, battery: battery,
+            unit: .mgdl, isNotLooping: false,
+            loopLastRunAt: loopRanAt?.timeIntervalSince1970
+        )
+    }
+
+    @Test("#a copy that brings the phone's battery and recommendation replaces one without")
+    func fillsInPhoneDetails() {
+        let current = snapshot(at: now, loopRanAt: now, iob: 1)
+        #expect(WatchRefreshPolicy.isUpdate(snapshot(at: now, loopRanAt: now, iob: 1, battery: 40, recBolus: 0.25), of: current))
+    }
+
+    @Test("#an older copy with less doesn't replace a fuller one")
+    func olderCopyIgnored() {
+        let current = snapshot(at: now, loopRanAt: now, iob: 1, battery: 40, recBolus: 0.25)
+        #expect(!WatchRefreshPolicy.isUpdate(snapshot(at: now, loopRanAt: now, iob: 1), of: current))
+        #expect(!WatchRefreshPolicy.isUpdate(current, of: current))
+    }
+
+    @Test("#a later loop run of the same reading replaces it; an earlier one doesn't")
+    func loopRuns() {
+        let current = snapshot(at: now, loopRanAt: now, iob: 1)
+        #expect(WatchRefreshPolicy.isUpdate(snapshot(at: now, loopRanAt: now.addingTimeInterval(60), iob: 2), of: current))
+        #expect(!WatchRefreshPolicy.isUpdate(snapshot(at: now, loopRanAt: now.addingTimeInterval(-60), iob: 2), of: current))
+    }
+
+    @Test("#the phone's copy completes a reading the Watch fetched itself")
+    func completesWatchFetch() {
+        #expect(WatchRefreshPolicy.isUpdate(snapshot(at: now, loopRanAt: now, iob: 1), of: snapshot(at: now)))
+    }
+
+    @Test("#another reading is never an update of this one")
+    func otherReading() {
+        let current = snapshot(at: now, loopRanAt: now, iob: 1)
+        #expect(!WatchRefreshPolicy.isUpdate(snapshot(at: now.addingTimeInterval(-300), loopRanAt: now, iob: 1, battery: 40), of: current))
+    }
 }

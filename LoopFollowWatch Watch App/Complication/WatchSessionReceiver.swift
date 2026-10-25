@@ -376,15 +376,7 @@ extension WatchSessionReceiver: WCSessionDelegate {
         }
         // Nothing stored to compare with: any reading beats none.
         guard let current = GlucoseSnapshotStore.shared.load() else { return (true, true) }
-        // The same reading may still bring news worth showing: the phone's copy of a reading the
-        // Watch fetched itself (BG only) adds IOB, COB and loop state, and a later loop run
-        // (after a bolus or carbs, or a refresh) updates them. Strictly newer only, so an older
-        // copy arriving late on another channel can't undo it.
-        guard current.updatedAt == snapshot.updatedAt else { return (false, false) }
-        let completesWatchFetch = current.iob == nil && current.loopLastRunAt == nil
-            && (snapshot.iob != nil || snapshot.loopLastRunAt != nil || snapshot.isNotLooping)
-        let newerLoopRun = (snapshot.loopLastRunAt ?? 0) > (current.loopLastRunAt ?? 0)
-        return (completesWatchFetch || newerLoopRun, false)
+        return (WatchRefreshPolicy.isUpdate(snapshot, of: current), false)
     }
 
     private func showLoopReturnConfirmation(title: String, body: String) {

@@ -44,6 +44,25 @@ enum WatchRefreshPolicy {
         updatedAt > lastReloadedAt
     }
 
+    /// Whether another copy of the reading the Watch has should replace it. The same reading can
+    /// still bring news worth showing: the phone's copy of a reading the Watch fetched itself (BG
+    /// only) adds IOB, COB and loop state; a later loop run (after a bolus or carbs, or a refresh)
+    /// updates them; and the phone's battery, the recommended bolus and the pump's details can
+    /// come in after the reading went out, as they do while the phone app starts. Only a copy that
+    /// brings more is taken, so an older one arriving late on another channel can't undo it.
+    static func isUpdate(_ incoming: GlucoseSnapshot, of current: GlucoseSnapshot) -> Bool {
+        guard incoming.updatedAt == current.updatedAt else { return false }
+        let completesWatchFetch = current.iob == nil && current.loopLastRunAt == nil
+            && (incoming.iob != nil || incoming.loopLastRunAt != nil || incoming.isNotLooping)
+        let newerLoopRun = (incoming.loopLastRunAt ?? 0) > (current.loopLastRunAt ?? 0)
+        let fillsIn = (current.battery == nil && incoming.battery != nil)
+            || (current.batteryIsCharging == nil && incoming.batteryIsCharging != nil)
+            || (current.recBolus == nil && incoming.recBolus != nil)
+            || (current.pumpBattery == nil && incoming.pumpBattery != nil)
+            || (current.pumpReservoirU == nil && incoming.pumpReservoirU != nil)
+        return completesWatchFetch || newerLoopRun || fillsIn
+    }
+
     /// Whether the phone may spend one of the daily high-priority complication transfers.
     static func isComplicationPushDue(now: Date, lastPush: Date, remainingTransfers: Int) -> Bool {
         remainingTransfers > 0 && now.timeIntervalSince(lastPush) >= complicationPushInterval
