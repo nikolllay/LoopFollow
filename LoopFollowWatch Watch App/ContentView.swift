@@ -11,21 +11,30 @@ import WatchKit
 /// What shows over the pages. Only one at a time: watchOS presents one sheet, and asking for a
 /// second while another is up, or while one is closing, can leave a screen that takes no taps.
 private enum RootSheet: Identifiable, Hashable {
-    case settings
-    case remote
+    /// A remote command's screen, from its tile or a shortcut complication.
+    case command(WatchRemoteScreen)
     case deviceAges
     case snooze
-    /// A shortcut complication's remote screen.
-    case shortcut(WatchDeepLink)
 
     var id: Self { self }
+}
+
+/// The pages, left to right: glucose, then the remote commands when they're set up, the graph,
+/// the stats, settings, and the data pages.
+private enum Page {
+    static let glucose = 0
+    static let remote = 1
+    static let graph = 2
+    static let stats = 3
+    static let settings = 4
+    static let firstData = 5
 }
 
 struct ContentView: View {
     @StateObject private var model = WatchViewModel()
     @State private var sheet: RootSheet?
-    /// The visible page; 0 is the glucose page.
-    @State private var page = 0
+    /// The visible page, from `Page`.
+    @State private var page = Page.glucose
     @Environment(\.scenePhase) private var scenePhase
 
     /// Last site change and sensor start, Unix epoch seconds; 0 when unknown.
@@ -35,7 +44,13 @@ struct ContentView: View {
     var body: some View {
         TabView(selection: $page) {
             GlucoseView(model: model)
-                .tag(0)
+                .tag(Page.glucose)
+
+            if model.remoteEnabled {
+                WatchRemotePage(snapshot: model.snapshot) { sheet = .command($0) }
+                    .tag(Page.remote)
+            }
+
             GlucoseChartView(
                 points: model.history,
                 treatments: model.treatments,
@@ -43,14 +58,17 @@ struct ContentView: View {
                 unit: model.snapshot?.unit ?? .mgdl,
                 colors: model.bgColors
             )
-            .tag(1)
+            .tag(Page.graph)
 
             StatsPageView(stats: model.stats, unit: model.snapshot?.unit ?? .mgdl)
-                .tag(2)
+                .tag(Page.stats)
+
+            NavigationStack { WatchAlertSettingsView(model: model) }
+                .tag(Page.settings)
 
             ForEach(model.pages.indices, id: \.self) { idx in
                 DataGridPage(slots: model.pages[idx], snapshot: model.snapshot)
-                    .tag(3 + idx)
+                    .tag(Page.firstData + idx)
             }
         }
         .tabViewStyle(.page)
@@ -58,7 +76,7 @@ struct ContentView: View {
         // row: space the page doesn't otherwise use, whose height differs between watch sizes.
         // Tapping them shows them larger.
         .overlay(alignment: .topLeading) {
-            if page == 0, pumpChangedAt > 0 || sensorChangedAt > 0 {
+            if page == Page.glucose, pumpChangedAt > 0 || sensorChangedAt > 0 {
                 GeometryReader { geo in
                     Button { sheet = .deviceAges } label: {
                         DeviceAgeBadges(
@@ -79,38 +97,16 @@ struct ContentView: View {
                 }
             }
         }
-        // Settings and remote commands in the bottom corners of the glucose page, either side of
-        // the page dots, so every row of the page has its full width.
-        .overlay(alignment: .bottom) {
-            if page == 0 {
-                GeometryReader { geo in
-                    HStack {
-                        cornerButton("gear", label: "Settings") { sheet = .settings }
-                        Spacer()
-                        if model.remoteEnabled {
-                            cornerButton("antenna.radiowaves.left.and.right", label: "Remote Commands") { sheet = .remote }
-                        }
-                    }
-                    // In from the screen's rounded corners.
-                    .padding(.horizontal, WatchLayout.scaled(22))
-                    // Centered in the strip the page dots sit in, below the page.
-                    .frame(width: geo.size.width, height: geo.safeAreaInsets.bottom)
-                    .offset(y: geo.size.height)
-                }
-            }
-        }
         // Every sheet is presented here, at the root, rather than from inside a page.
         .sheet(item: $sheet, onDismiss: {
             // Picks up a snooze just set, among other things.
             model.refresh()
-            // A snooze asked for while the remote screens were open, now that they've closed.
+            // A snooze asked for while a remote screen was open, now that it has closed.
             if model.showSnoozeSheet, sheet == nil { sheet = .snooze }
         }) { shown in
             switch shown {
-            case .settings:
-                NavigationStack { WatchAlertSettingsView(model: model) }
-            case .remote:
-                NavigationStack { WatchRemoteCommandsView(snapshot: model.snapshot, onFinished: closeRemote) }
+            case let .command(screen):
+                NavigationStack { remoteView(for: screen) }
             case .deviceAges:
                 NavigationStack {
                     DeviceAgeDetailView(
@@ -122,19 +118,15 @@ struct ContentView: View {
                 }
             case .snooze:
                 SnoozeView(isPresented: snoozeShown, alertType: model.pendingSnoozeType)
-            case let .shortcut(link):
-                NavigationStack { remoteView(for: link) }
             }
         }
-        // An alert's Snooze action asks for the snooze sheet. It takes the place of settings or the
-        // ages, but waits for the remote screens to close, so a command on its way isn't cut off
-        // before its result shows. Checked on appear too, for a Snooze tap that opened the app.
+        // An alert's Snooze action asks for the snooze sheet. It takes the place of the ages, but
+        // waits for a remote screen to close, so a command on its way isn't cut off before its
+        // result shows. Checked on appear too, for a Snooze tap that opened the app.
         .onChange(of: model.showSnoozeSheet, initial: true) { _, show in
             guard show else { return }
-            switch sheet {
-            case .remote, .shortcut: break
-            default: sheet = .snooze
-            }
+            if case .command = sheet { return }
+            sheet = .snooze
         }
         .onChange(of: sheet) { old, new in
             // The snooze sheet has closed, or a shortcut has taken its place.
@@ -144,16 +136,21 @@ struct ContentView: View {
             // Opening the app starts on the glucose page. Raising the wrist after just lowering
             // it (inactive, not background) keeps the page you were looking at.
             if newPhase == .active, oldPhase == .background {
-                page = 0
+                page = Page.glucose
             }
         }
         .onOpenURL { url in
             // Shortcut complications land on their remote screen; without remote
             // commands configured they simply open the app.
             guard let link = WatchDeepLink(url: url), LAAppGroupSettings.isWatchRemoteEnabled() else { return }
-            // The override shortcut opens Loop's presets; Trio's overrides are in the remote menu.
-            if link == .override, LAAppGroupSettings.watchRemoteSystem() != .loop { return }
-            sheet = .shortcut(link)
+            switch link {
+            case .bolus: sheet = .command(.bolus)
+            case .meal: sheet = .command(.meal)
+            case .override:
+                // The override shortcut opens Loop's presets; Trio's overrides are on the remote page.
+                guard LAAppGroupSettings.watchRemoteSystem() == .loop else { return }
+                sheet = .command(.presets)
+            }
         }
         .onAppear {
             model.refresh()
@@ -165,37 +162,25 @@ struct ContentView: View {
 
 extension ContentView {
     @ViewBuilder
-    private func remoteView(for link: WatchDeepLink) -> some View {
-        switch link {
-        case .bolus: WatchBolusCommandView(snapshot: model.snapshot, onFinished: closeRemote)
+    private func remoteView(for screen: WatchRemoteScreen) -> some View {
+        switch screen {
         case .meal: WatchMealCommandView(onFinished: closeRemote)
-        case .override: WatchOverridePickerView(onFinished: closeRemote)
+        case .bolus: WatchBolusCommandView(snapshot: model.snapshot, onFinished: closeRemote)
+        case .tempTarget: WatchTempTargetView(snapshot: model.snapshot, onFinished: closeRemote)
+        case .overrides: WatchTrioOverridesView(snapshot: model.snapshot, onFinished: closeRemote)
+        case .presets: WatchOverridePickerView(onFinished: closeRemote)
         }
-    }
-
-    /// A round button for a bottom corner, like the system's.
-    private func cornerButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: GlucoseView.iconSize, weight: .medium))
-                .foregroundColor(.white)
-                .frame(width: GlucoseView.iconFrame, height: GlucoseView.iconFrame)
-                .background(Color.white.opacity(0.18), in: Circle())
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
     }
 
     private var snoozeShown: Binding<Bool> {
         Binding(get: { sheet == .snooze }, set: { if !$0, sheet == .snooze { sheet = nil } })
     }
 
-    /// Closes the remote screens and shows the glucose page, so after a command has gone out
+    /// Closes the remote screen and shows the glucose page, so after a command has gone out
     /// the send button is out of reach.
     private func closeRemote() {
         sheet = nil
-        page = 0
+        page = Page.glucose
     }
 }
 
@@ -376,9 +361,6 @@ struct GlucoseView: View {
     @ObservedObject var model: WatchViewModel
     @Environment(\.dynamicTypeSize) private var typeSize
 
-    /// The settings and remote buttons in the bottom corners.
-    static let iconSize = WatchLayout.scaled(15)
-    static let iconFrame = WatchLayout.scaled(30)
     /// Room left and right of the page's text, clear of the screen's rounded edge.
     static let sideMargin = WatchLayout.scaled(10)
 
@@ -577,7 +559,8 @@ private struct GlucoseReadingView: View, Equatable {
         .foregroundColor(freshness.color)
     }
 
-    /// Makes `content` refresh when tapped.
+    /// Makes `content` refresh when tapped. Only the sync counter does, so nothing else on the
+    /// page fetches by mistake.
     private func refreshButton(_ content: some View) -> some View {
         Button(action: onRefresh) {
             content.contentShape(Rectangle())
@@ -591,8 +574,8 @@ private struct GlucoseReadingView: View, Equatable {
     /// in place of the battery while charging, as on the phone; then the pump's reservoir.
     private var syncAndBattery: some View {
         let battery = snapshot.battery
-        return refreshButton(FittedRow(spacing: WatchLayout.scaled(10)) { fit in
-            syncCounter(fit: fit)
+        return FittedRow(spacing: WatchLayout.scaled(10)) { fit in
+            refreshButton(syncCounter(fit: fit))
             if let battery {
                 (batteryIcon(battery) + Text(" \(Int(battery.rounded()))%"))
                     .font(.system(size: statusFontSize * fit))
@@ -606,7 +589,6 @@ private struct GlucoseReadingView: View, Equatable {
                     .foregroundColor(.white)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading))
     }
 
     /// A green bolt while charging, like the phone's ⚡️; otherwise a battery that empties with the level.
