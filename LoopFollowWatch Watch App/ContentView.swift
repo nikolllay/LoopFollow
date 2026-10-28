@@ -19,15 +19,16 @@ private enum RootSheet: Identifiable, Hashable {
     var id: Self { self }
 }
 
-/// The pages, left to right: glucose, then the remote commands when they're set up, the graph,
-/// the stats, settings, and the data pages.
+/// The pages, left to right: glucose, then the remote commands when they're set up, the
+/// treatments, the graph, the stats, settings, and the data pages.
 private enum Page {
     static let glucose = 0
     static let remote = 1
-    static let graph = 2
-    static let stats = 3
-    static let settings = 4
-    static let firstData = 5
+    static let treatments = 2
+    static let graph = 3
+    static let stats = 4
+    static let settings = 5
+    static let firstData = 6
 }
 
 struct ContentView: View {
@@ -50,6 +51,9 @@ struct ContentView: View {
                 WatchRemotePage(snapshot: model.snapshot) { sheet = .command($0) }
                     .tag(Page.remote)
             }
+
+            WatchTreatmentsPage(unit: model.snapshot?.unit ?? .mgdl, isVisible: page == Page.treatments)
+                .tag(Page.treatments)
 
             GlucoseChartView(
                 points: model.history,
@@ -290,7 +294,7 @@ final class WatchViewModel: ObservableObject {
             setIfChanged(\.snapshot, loaded)
         }
         // Also after a bolus from the Watch, which the remote screens record as they close.
-        setIfChanged(\.recommendedBolus, snapshot.flatMap(Self.recommendation(for:)))
+        setIfChanged(\.recommendedBolus, snapshot.flatMap { Self.recommendation(for: $0) })
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
         setIfChanged(\.isSnoozed, WatchAlertManager.shared.isGloballySnoozed)
         setIfChanged(\.snoozeUntil, WatchAlertManager.shared.globalSnoozeExpiryDate)
