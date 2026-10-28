@@ -142,6 +142,10 @@ struct ContentView: View {
             if newPhase == .active, oldPhase == .background {
                 page = Page.glucose
             }
+            // An alarm may have been snoozed or stopped from its notification meanwhile.
+            if newPhase == .active {
+                model.refresh()
+            }
         }
         .onOpenURL { url in
             // Shortcut complications land on their remote screen; without remote
@@ -215,6 +219,7 @@ final class WatchViewModel: ObservableObject {
     private var notificationObserver: Any?
     private var snoozeSheetObserver: Any?
     private var settingsObserver: Any?
+    private var alarmsObserver: Any?
     private var appSettingsObserver: AnyCancellable?
 
     init() {
@@ -247,6 +252,14 @@ final class WatchViewModel: ObservableObject {
         ) { [weak self] _ in
             self?.refresh()
         }
+        // An alarm can start, end, or be stopped or snoozed without a new reading being saved.
+        alarmsObserver = NotificationCenter.default.addObserver(
+            forName: .watchAlarmsChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refresh()
+        }
         snoozeSheetObserver = NotificationCenter.default.addObserver(
             forName: .showSnoozeSheet,
             object: nil,
@@ -263,6 +276,7 @@ final class WatchViewModel: ObservableObject {
         if let obs = notificationObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = snoozeSheetObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = settingsObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = alarmsObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
     /// Shortest time the refresh spinner shows, so a quick answer still reads as one.
@@ -393,6 +407,10 @@ struct GlucoseView: View {
                             model.pendingSnoozeType = nil
                             model.showSnoozeSheet = true
                         },
+                        onStop: {
+                            WatchAlertManager.shared.stopAll()
+                            model.refresh()
+                        },
                         onCancelSnooze: {
                             WatchAlertManager.shared.cancelAllSnoozes()
                             model.refresh()
@@ -454,6 +472,7 @@ private struct GlucoseReadingView: View, Equatable {
     /// Tapping the sync counter fetches the latest data, like pull-to-refresh on the phone.
     let onRefresh: () -> Void
     let onSnooze: () -> Void
+    let onStop: () -> Void
     let onCancelSnooze: () -> Void
 
     static func == (a: Self, b: Self) -> Bool {
@@ -472,7 +491,11 @@ private struct GlucoseReadingView: View, Equatable {
 
     var body: some View {
         if freshness == .stale {
-            GlucosePlaceholder(caption: refreshButton(syncCounter().lineLimit(1).minimumScaleFactor(Self.minimumScale)))
+            // An alarm can still be sounding, or alerts snoozed, while the reading is too old to show.
+            GlucosePlaceholder(caption: VStack(spacing: WatchLayout.scaled(4)) {
+                refreshButton(syncCounter().lineLimit(1).minimumScaleFactor(Self.minimumScale))
+                snoozeLine
+            })
         } else {
             reading
         }
@@ -605,25 +628,37 @@ private struct GlucoseReadingView: View, Equatable {
         }
     }
 
-    /// While an alert's threshold is met, a button to snooze the Watch's alerts; while they're
-    /// snoozed, until when, with a button to cancel. Nothing otherwise, and then the page is as
-    /// usual; with it, the BG number makes room.
+    /// While an alarm sounds, buttons to snooze it, or to stop it and leave alerts on; while
+    /// alerts are snoozed, until when, with a button to cancel. Nothing otherwise, and then the
+    /// page is as usual; with it, the BG number makes room.
     @ViewBuilder
     private var snoozeLine: some View {
         switch alert {
         case .none:
             EmptyView()
         case .active:
-            // Large and easy to hit during an alarm; the BG number and the rows make room for it.
-            Button(action: onSnooze) {
-                Label("Snooze…", systemImage: "bell.fill")
-                    .font(.system(size: WatchLayout.scaled(21), weight: .bold))
-                    .foregroundColor(.orange)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, WatchLayout.scaled(7))
-                    .background(Color.orange.opacity(0.25), in: Capsule())
+            // Large and easy to hit during an alarm; the BG number and the rows make room for them.
+            HStack(spacing: WatchLayout.scaled(6)) {
+                Button(action: onSnooze) {
+                    Label("Snooze…", systemImage: "bell.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, WatchLayout.scaled(7))
+                        .background(Color.orange.opacity(0.25), in: Capsule())
+                }
+                Button(action: onStop) {
+                    Text("Stop")
+                        .padding(.horizontal, WatchLayout.scaled(12))
+                        .padding(.vertical, WatchLayout.scaled(7))
+                        .background(Color.white.opacity(0.15), in: Capsule())
+                }
+                .foregroundColor(.white)
+                .accessibilityHint("Stops the alarm; alerts stay on")
             }
             .buttonStyle(.plain)
+            .font(.system(size: WatchLayout.scaled(19), weight: .bold))
+            .foregroundColor(.orange)
+            .lineLimit(1)
+            .minimumScaleFactor(Self.minimumScale)
             .padding(.top, WatchLayout.scaled(4))
         case let .snoozed(until):
             HStack(spacing: WatchLayout.scaled(6)) {

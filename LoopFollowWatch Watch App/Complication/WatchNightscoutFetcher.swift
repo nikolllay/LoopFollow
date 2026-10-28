@@ -155,6 +155,9 @@ final class WatchNightscoutFetcher: NSObject {
                 return
             }
 
+            // Ends an alarm this reading shows is over, as the phone's would.
+            WatchAlertManager.shared.resolve(snapshot: snapshot)
+
             os_log(
                 "WatchNightscoutFetcher: new entry g=%d at %f, saving",
                 log: fetchLog,

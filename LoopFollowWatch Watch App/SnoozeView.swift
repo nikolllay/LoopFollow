@@ -44,6 +44,13 @@ struct SnoozeView: View {
                         .toggleStyle(.switch)
                 }
 
+                // A snooze of every alert doesn't reach urgent low unless it's the one sounding.
+                if snoozeAll || alertType == nil, alertType != .urgentLow, !WatchAlertManager.shared.isSounding(.urgentLow) {
+                    Text("Urgent Low will still sound")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+
                 HStack(spacing: 16) {
                     Button("Cancel") {
                         isPresented = false
