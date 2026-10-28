@@ -195,9 +195,8 @@ final class WatchViewModel: ObservableObject {
     @Published var selectedSlots: [LiveActivitySlotOption] = LAAppGroupSettings.watchSelectedSlots()
     @Published var showSnoozeSheet = false
     @Published var pendingSnoozeType: WatchAlertType?
-    @Published var isSnoozed = false
-    @Published var snoozeUntil: Date?
-    @Published var hasActiveAlert = false
+    /// What the glucose page offers for the Watch's alerts.
+    @Published var snoozeStatus = WatchAlertManager.SnoozeStatus.none
     @Published var remoteEnabled = LAAppGroupSettings.isWatchRemoteEnabled()
     @Published var history: [WatchGlucoseHistory.Point] = WatchGlucoseHistory.load()?.points ?? []
     @Published var treatments: [WatchTreatmentHistory.Treatment] = WatchTreatmentHistory.load()?.treatments ?? []
@@ -296,9 +295,7 @@ final class WatchViewModel: ObservableObject {
         // Also after a bolus from the Watch, which the remote screens record as they close.
         setIfChanged(\.recommendedBolus, snapshot.flatMap { Self.recommendation(for: $0) })
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
-        setIfChanged(\.isSnoozed, WatchAlertManager.shared.isGloballySnoozed)
-        setIfChanged(\.snoozeUntil, WatchAlertManager.shared.globalSnoozeExpiryDate)
-        setIfChanged(\.hasActiveAlert, snapshot.map { WatchAlertManager.shared.hasActiveAlert(for: $0) } ?? false)
+        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus(for: snapshot))
         setIfChanged(\.remoteEnabled, LAAppGroupSettings.isWatchRemoteEnabled())
         setIfChanged(\.bgColors, GlucoseColor.Scheme.current())
         setIfChanged(\.pumpAgeColoring, LAAppGroupSettings.watchPumpAgeColoring())
@@ -310,7 +307,7 @@ final class WatchViewModel: ObservableObject {
         setIfChanged(\.snapshot, snapshot)
         setIfChanged(\.recommendedBolus, Self.recommendation(for: snapshot))
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
-        setIfChanged(\.hasActiveAlert, WatchAlertManager.shared.hasActiveAlert(for: snapshot))
+        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus(for: snapshot))
         loadHistories()
     }
 
@@ -374,7 +371,8 @@ struct GlucoseView: View {
                 let bgColor = model.bgColors.color(forMgdl: s.glucose)
                 // Colored like the BG, so a predicted low or high stands out.
                 let projectedColor = s.projected.map { model.bgColors.color(forMgdl: $0) } ?? .white
-                let textFactor = WatchLayout.textFactor(for: typeSize)
+                // During an alarm the rows give up a little of their size to the snooze button.
+                let textFactor = WatchLayout.textFactor(for: typeSize) * (model.snoozeStatus == .active ? 0.9 : 1)
                 // Ticks every second so the counter's color, and the switch to "--" once the
                 // reading is too old, land on time. A tick only works out the freshness; the page
                 // redraws when that, the reading or its color changes. An explicit schedule for
@@ -389,7 +387,16 @@ struct GlucoseView: View {
                         recommendedBolus: model.recommendedBolus,
                         textFactor: textFactor,
                         isRefreshing: model.isRefreshing,
-                        onRefresh: model.requestRefresh
+                        alert: model.snoozeStatus,
+                        onRefresh: model.requestRefresh,
+                        onSnooze: {
+                            model.pendingSnoozeType = nil
+                            model.showSnoozeSheet = true
+                        },
+                        onCancelSnooze: {
+                            WatchAlertManager.shared.cancelAllSnoozes()
+                            model.refresh()
+                        }
                     )
                     .equatable()
                 }
@@ -443,13 +450,16 @@ private struct GlucoseReadingView: View, Equatable {
     /// The watch's Text Size, as `WatchLayout.textFactor`.
     let textFactor: CGFloat
     let isRefreshing: Bool
+    let alert: WatchAlertManager.SnoozeStatus
     /// Tapping the sync counter fetches the latest data, like pull-to-refresh on the phone.
     let onRefresh: () -> Void
+    let onSnooze: () -> Void
+    let onCancelSnooze: () -> Void
 
     static func == (a: Self, b: Self) -> Bool {
         a.snapshot == b.snapshot && a.freshness == b.freshness && a.bgColor == b.bgColor
             && a.projectedColor == b.projectedColor && a.recommendedBolus == b.recommendedBolus
-            && a.textFactor == b.textFactor && a.isRefreshing == b.isRefreshing
+            && a.textFactor == b.textFactor && a.isRefreshing == b.isRefreshing && a.alert == b.alert
     }
 
     private var infoFontSize: CGFloat { WatchLayout.scaled(20) * textFactor }
@@ -595,6 +605,50 @@ private struct GlucoseReadingView: View, Equatable {
         }
     }
 
+    /// While an alert's threshold is met, a button to snooze the Watch's alerts; while they're
+    /// snoozed, until when, with a button to cancel. Nothing otherwise, and then the page is as
+    /// usual; with it, the BG number makes room.
+    @ViewBuilder
+    private var snoozeLine: some View {
+        switch alert {
+        case .none:
+            EmptyView()
+        case .active:
+            // Large and easy to hit during an alarm; the BG number and the rows make room for it.
+            Button(action: onSnooze) {
+                Label("Snooze…", systemImage: "bell.fill")
+                    .font(.system(size: WatchLayout.scaled(21), weight: .bold))
+                    .foregroundColor(.orange)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, WatchLayout.scaled(7))
+                    .background(Color.orange.opacity(0.25), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .padding(.top, WatchLayout.scaled(4))
+        case let .snoozed(until):
+            HStack(spacing: WatchLayout.scaled(6)) {
+                Label {
+                    Text("until \(until, style: .time)")
+                } icon: {
+                    Image(systemName: "bell.slash.fill")
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(Self.minimumScale)
+                .accessibilityLabel("Alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))")
+                Spacer(minLength: 0)
+                Button("Cancel", action: onCancelSnooze)
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, WatchLayout.scaled(10))
+                    .padding(.vertical, WatchLayout.scaled(2))
+                    .background(Color.orange.opacity(0.2), in: Capsule())
+                    .accessibilityLabel("Cancel snooze")
+            }
+            .font(.system(size: statusFontSize * 0.9, weight: .semibold))
+            .foregroundColor(.orange)
+            .padding(.top, WatchLayout.scaled(2))
+        }
+    }
+
     /// A green bolt while charging, like the phone's ⚡️; otherwise a battery that empties with the level.
     private func batteryIcon(_ percent: Double) -> Text {
         guard snapshot.batteryIsCharging == true else {
@@ -639,6 +693,8 @@ private struct GlucoseReadingView: View, Equatable {
                 }
 
                 syncAndBattery
+
+                snoozeLine
             }
             // The rows get their full height first; when the page runs short, the BG number
             // gives way instead of the rows shrinking unevenly.

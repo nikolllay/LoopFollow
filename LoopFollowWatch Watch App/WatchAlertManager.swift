@@ -184,17 +184,47 @@ final class WatchAlertManager: NSObject {
 
     // MARK: - Active alert query
 
-    /// Returns true if any alert threshold is currently met for the snapshot,
-    /// regardless of cooldown or snooze state. Used to decide whether to show the Snooze button.
-    func hasActiveAlert(for snapshot: GlucoseSnapshot) -> Bool {
-        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else { return false }
+    /// The alerts whose thresholds the snapshot meets, weighed as `checkAndAlert` weighs them,
+    /// regardless of cooldown or snooze.
+    func triggeredAlerts(for snapshot: GlucoseSnapshot) -> [WatchAlertType] {
+        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else { return [] }
         let bg = snapshot.glucose
         let delta = snapshot.deltaRate
-        return bg <= thresholds.urgentLow
-            || bg < thresholds.low
-            || bg > thresholds.high
-            || delta.map { $0 < -thresholds.dropRate } ?? false
-            || delta.map { $0 > thresholds.riseRate } ?? false
+        if bg <= thresholds.urgentLow { return [.urgentLow] }
+        if bg < thresholds.low { return [.lowBG] }
+        var types: [WatchAlertType] = []
+        if bg > thresholds.high { types.append(.highBG) }
+        if delta.map({ $0 < -thresholds.dropRate }) ?? false { types.append(.fastDrop) }
+        if delta.map({ $0 > thresholds.riseRate }) ?? false { types.append(.fastRise) }
+        return types
+    }
+
+    /// What the glucose page offers for the alerts.
+    enum SnoozeStatus: Equatable {
+        case none
+        /// An alert's threshold is met and it isn't snoozed: a Snooze button.
+        case active
+        /// Alerts are snoozed until then: a Cancel button.
+        case snoozed(until: Date)
+    }
+
+    func snoozeStatus(for snapshot: GlucoseSnapshot?) -> SnoozeStatus {
+        // A snooze of every alert shows whatever BG is doing, so it can always be cancelled.
+        if let until = globalSnoozeExpiryDate { return .snoozed(until: until) }
+        let triggered = snapshot.map(triggeredAlerts(for:)) ?? []
+        if triggered.contains(where: { !isSnoozed(for: $0) }) { return .active }
+        // Every alert met is snoozed on its own, from its notification.
+        if let until = triggered.compactMap({ snoozeUntil(for: $0) }).max() { return .snoozed(until: until) }
+        return .none
+    }
+
+    /// Ends every snooze, of all alerts and of each on its own, so alerts sound again when met.
+    func cancelAllSnoozes() {
+        defaults.set(0, forKey: globalSnoozeKey)
+        for type in WatchAlertType.allCases {
+            defaults.set(0, forKey: type.snoozeKey)
+        }
+        os_log("WatchAlertManager: all snoozes cancelled", log: alertLog, type: .info)
     }
 
     // MARK: - Check (main entry point — call from both WC and background refresh paths)
@@ -300,6 +330,8 @@ extension WatchAlertManager: UNUserNotificationCenterDelegate {
         willPresent _: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .badge])
+        // With the app open, a banner alone shows for a moment and is gone with its Snooze and
+        // Dismiss; the list keeps the alert in Notification Center until it's dealt with.
+        completionHandler([.banner, .list, .badge])
     }
 }
