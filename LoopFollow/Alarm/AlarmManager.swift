@@ -10,6 +10,27 @@ class AlarmManager {
     private let evaluators: [AlarmType: AlarmCondition]
     private var lastBGAlarmTime: Date?
 
+    /// The alarm sounding, as the Watch mirrors it: when it started, and how its sound plays.
+    struct Sounding: Equatable {
+        let id: UUID
+        let since: Date
+        let playsSound: Bool
+        let repeats: Bool
+    }
+
+    /// Set while `Observable.shared.currentAlarm` is. Main thread only.
+    private(set) var sounding: Sounding?
+
+    /// The sounding that ended last, and when, so a Watch answer given as it ended still counts.
+    struct Ended: Equatable {
+        let id: UUID
+        let since: Date
+        let at: Date
+    }
+
+    /// Main thread only.
+    private var lastEnded: Ended?
+
     private init(
         conditionTypes: [AlarmCondition.Type] = [
             BuildExpireCondition.self,
@@ -135,7 +156,12 @@ class AlarmManager {
             // Fire the alarm and break the loop; we only allow one alarm per evaluation tick.
             Observable.shared.currentAlarm.value = alarm.id
 
-            alarm.trigger(config: Storage.shared.alarmConfiguration.value, now: now)
+            let sound = alarm.trigger(config: Storage.shared.alarmConfiguration.value, now: now)
+            // One it takes the place of has ended, as far as an answer from the Watch goes.
+            if let sounding {
+                lastEnded = Ended(id: sounding.id, since: sounding.since, at: now)
+            }
+            sounding = Sounding(id: alarm.id, since: now, playsSound: sound.playsSound, repeats: sound.repeats)
 
             // Store the latest bg time so we don't use it again
             if alarm.type.isBGBased,
@@ -182,8 +208,111 @@ class AlarmManager {
 
     func stopAlarm() {
         AlarmSound.stop()
+        if let sounding {
+            lastEnded = Ended(id: sounding.id, since: sounding.since, at: Date())
+        }
+        sounding = nil
         Observable.shared.currentAlarm.value = nil
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+    }
+
+    // MARK: - From the Watch
+
+    /// What a snooze or stop from the Watch reaches.
+    enum AnswerTarget: Equatable {
+        /// The sounding it answers, still sounding.
+        case sounding
+        /// The alarm, whose sounding ended just as the answer was given, before the Watch heard.
+        case endedAlarm
+        /// Nothing: an answer to a sounding long over, or one that arrived late from a Watch that was
+        /// out of reach, as the Snooze on an older notification on the phone does nothing.
+        case none
+    }
+
+    static func target(of answer: WatchAlarmCommand.Answer, sounding: Sounding?, lastEnded: Ended?, now: Date) -> AnswerTarget {
+        func isAnswered(_ id: UUID, since: Date) -> Bool {
+            id == answer.id && abs(since.timeIntervalSince1970 - answer.since) < 0.001
+        }
+        if let sounding, isAnswered(sounding.id, since: sounding.since) { return .sounding }
+        let issued = Date(timeIntervalSince1970: answer.issuedAt)
+        guard now.timeIntervalSince(issued) <= WatchAlarmCommand.answerGrace,
+              let lastEnded, isAnswered(lastEnded.id, since: lastEnded.since),
+              issued.timeIntervalSince(lastEnded.at) <= WatchAlarmCommand.answerGrace
+        else { return .none }
+        return .endedAlarm
+    }
+
+    /// Until when a Watch snooze keeps an alarm quiet that's no longer sounding: `units` of its
+    /// snooze time from when the snooze was given. Nil when that has passed, or isn't later than
+    /// the snooze the alarm has, which it never shortens.
+    static func snoozedUntil(issuedAt: TimeInterval, units: Int, unitSeconds: TimeInterval, current: Date?, now: Date) -> Date? {
+        let until = Date(timeIntervalSince1970: issuedAt).addingTimeInterval(Double(units) * unitSeconds)
+        guard until > now, until > (current ?? .distantPast) else { return nil }
+        return until
+    }
+
+    /// Snoozes the alarm from the Watch for `units` of its snooze time, kept to what its snooze
+    /// screen offers, or for its own length when nil. The sounding answered stops, as does one of the
+    /// same alarm that started just after it, before the Watch heard; an alarm whose sounding ended
+    /// just as the snooze was given is kept quiet for that long. Anything else is left alone.
+    /// Main thread only.
+    func snooze(_ answer: WatchAlarmCommand.Answer, units: Int?) {
+        let now = Date()
+        var alarms = Storage.shared.alarms.value
+        guard Self.target(of: answer, sounding: sounding, lastEnded: lastEnded, now: now) != .none,
+              let idx = alarms.firstIndex(where: { $0.id == answer.id })
+        else {
+            LogManager.shared.log(category: .alarm, message: "Watch snooze of an alarm no longer sounding, ignored")
+            return
+        }
+        let type = alarms[idx].type
+        let units = min(max(units ?? alarms[idx].snoozeDuration, type.snoozeRange.lowerBound), type.snoozeRange.upperBound)
+        if Observable.shared.currentAlarm.value == answer.id {
+            performSnooze(units)
+        } else if let until = Self.snoozedUntil(
+            issuedAt: answer.issuedAt,
+            units: units,
+            unitSeconds: type.snoozeTimeUnit.seconds,
+            current: alarms[idx].snoozedUntil,
+            now: now
+        ) {
+            alarms[idx].snoozedUntil = until
+            Storage.shared.alarms.value = alarms
+        }
+    }
+
+    /// Stops the alarm from the Watch without a snooze, as Acknowledge does: the sounding answered,
+    /// or one of the same alarm that started just after it, before the Watch heard. Main thread only.
+    func stop(_ answer: WatchAlarmCommand.Answer) {
+        guard Self.target(of: answer, sounding: sounding, lastEnded: lastEnded, now: Date()) != .none,
+              Observable.shared.currentAlarm.value == answer.id
+        else {
+            LogManager.shared.log(category: .alarm, message: "Watch stop of an alarm no longer sounding, ignored")
+            return
+        }
+        performSnooze(0)
+    }
+
+    /// Whether a snooze is still the one the Watch showed, ending at `shown`. A minute either way
+    /// allows for a snooze the Watch set itself and showed before the phone's own time for it came.
+    static func isSameSnooze(_ current: Date?, as shown: TimeInterval?) -> Bool {
+        guard let current, let shown else { return false }
+        return abs(current.timeIntervalSince1970 - shown) <= 60
+    }
+
+    /// Ends the snoozes the Watch showed, the alarm's own and Snooze All, while they're still those
+    /// it showed, however late the request arrives; a snooze set since stands. Main thread only.
+    func cancelSnoozes(alarmID: UUID?, until: TimeInterval?, allUntil: TimeInterval?) {
+        var alarms = Storage.shared.alarms.value
+        if let idx = alarms.firstIndex(where: { $0.id == alarmID }), Self.isSameSnooze(alarms[idx].snoozedUntil, as: until) {
+            alarms[idx].snoozedUntil = nil
+            Storage.shared.alarms.value = alarms
+        }
+        var config = Storage.shared.alarmConfiguration.value
+        if Self.isSameSnooze(config.snoozeUntil, as: allUntil) {
+            config.snoozeUntil = nil
+            Storage.shared.alarmConfiguration.value = config
+        }
     }
 
     func sendNotification(title: String, actionTitle: String? = nil) {

@@ -4,6 +4,7 @@
 import Foundation
 import os.log
 import UserNotifications
+import WatchConnectivity
 
 private let alertLog = OSLog(
     subsystem: Bundle.main.bundleIdentifier ?? "com.loopfollow.watch",
@@ -16,270 +17,100 @@ extension Notification.Name {
     static let watchAlarmsChanged = Notification.Name("WatchAlarmsChanged")
 }
 
-// MARK: - Alert type
-
-enum WatchAlertType: String, CaseIterable {
-    case lowBG, urgentLow, highBG, fastDrop, fastRise
-
-    var title: String {
-        switch self {
-        case .lowBG: return "⚠️ Low BG"
-        case .urgentLow: return "🚨 Urgent Low"
-        case .highBG: return "⚠️ High BG"
-        case .fastDrop: return "⬇️ Dropping Fast"
-        case .fastRise: return "⬆️ Rising Fast"
-        }
-    }
-
-    var displayName: String {
-        switch self {
-        case .lowBG: return "Low BG"
-        case .urgentLow: return "Urgent Low"
-        case .highBG: return "High BG"
-        case .fastDrop: return "Fast Drop"
-        case .fastRise: return "Fast Rise"
-        }
-    }
-
-    func body(bg: Double, delta: Double?) -> String {
-        let bgStr = "\(Int(bg))"
-        switch self {
-        case .lowBG, .urgentLow, .highBG: return bgStr
-        case .fastDrop: return delta.map { "\(bgStr) · \(Int($0))/min" } ?? bgStr
-        case .fastRise: return delta.map { "\(bgStr) · +\(Int($0))/min" } ?? bgStr
-        }
-    }
-
-    var cooldownKey: String { "watchAlertCooldown_\(rawValue)" }
-    var snoozeKey: String { "watchSnoozeUntil_\(rawValue)" }
-    var notificationID: String { "lf-alert-\(rawValue)" }
-}
-
-// MARK: - Thresholds
-
-private struct WatchThresholds {
-    var low: Double
-    var urgentLow: Double
-    var high: Double
-    var dropRate: Double = 2.0 // mg/dL per minute
-    var riseRate: Double = 2.0
-
-    /// Low/high follow the iPhone's BG lines, synced into the Watch App Group.
-    /// Urgent low stays at 55 mg/dL unless the low line is set below that.
-    static func current() -> WatchThresholds {
-        let lines = LAAppGroupSettings.thresholdsMgdl()
-        return WatchThresholds(low: lines.low, urgentLow: min(55, lines.low), high: lines.high)
-    }
-}
-
 // MARK: - Manager
 
+/// Sounds the phone's alarms on the Watch. The phone decides every alarm from its own list and says
+/// which one is sounding with each update; the Watch alerts for that one, repeating while the phone
+/// repeats it, until it's snoozed or stopped here or on the phone, or the phone ends it. An alarm
+/// the phone has turned off or snoozed never sounds here.
 final class WatchAlertManager: NSObject {
+    typealias Sounding = WatchAlarmState.Sounding
+
     static let shared = WatchAlertManager()
-    override private init() { super.init() }
 
-    private var thresholds: WatchThresholds { WatchThresholds.current() }
-    private let settings = WatchAppSettings.shared
+    override private init() {
+        super.init()
+        // Before any alarm can be posted, so its notification has its actions.
+        registerNotificationCategories()
+    }
+
     private let alertQueue = DispatchQueue(label: "com.loopfollow.watch.alertManager")
-
-    private let globalSnoozeKey = "watchGlobalSnoozeUntil"
-
-    // MARK: - Repeating
-
-    /// An alarm keeps alerting until it's snoozed or stopped, or its threshold is no longer met,
-    /// like the phone's: its notification comes again this often.
-    private static let repeatInterval: TimeInterval = 30
-    /// How far ahead the repeats are scheduled. Each reading, every 5 minutes, schedules the
-    /// next stretch, so they go on for as long as the alarm is unanswered.
-    private static let repeatWindow: TimeInterval = 10 * 60
-    private static var repeatCount: Int { Int(repeatWindow / repeatInterval) }
-    /// Only the most urgent unanswered alarm repeats, so two never sound together.
-    private static let repeatPriority: [WatchAlertType] = [.urgentLow, .lowBG, .fastDrop, .highBG, .fastRise]
-
-    /// Whether the alarm has fired and is still unanswered.
-    private func isOpen(_ type: WatchAlertType) -> Bool {
-        defaults.bool(forKey: "watchAlarmOpen_\(type.rawValue)")
-    }
-
-    private func setOpen(_ type: WatchAlertType, _ open: Bool) {
-        defaults.set(open, forKey: "watchAlarmOpen_\(type.rawValue)")
-    }
-
-    private func repeatIDs(for type: WatchAlertType) -> [String] {
-        (1 ... Self.repeatCount).map { "\(type.notificationID)-r\($0)" }
-    }
-
-    /// Its first notification and every repeat.
-    private func notificationIDs(for type: WatchAlertType) -> [String] {
-        [type.notificationID] + repeatIDs(for: type)
-    }
-
-    /// The latest reading checked, for the repeats scheduled after a Stop or Snooze. Kept in
-    /// memory, on `alertQueue`: after a relaunch the repeats already scheduled run on until the
-    /// next reading.
-    private var lastReading: (bg: Double, delta: Double?)?
-
-    private var openAlarms: [WatchAlertType] {
-        WatchAlertType.allCases.filter(isOpen)
-    }
-
-    /// Whether the alarm is sounding, unanswered.
-    func isSounding(_ type: WatchAlertType) -> Bool {
-        isOpen(type)
-    }
-
-    /// Every alert whose own threshold the snapshot meets. Unlike `triggeredAlerts`, a low under
-    /// an urgent low counts, so an alarm that's sounding stays on for as long as it's met.
-    private func metAlerts(for snapshot: GlucoseSnapshot) -> Set<WatchAlertType> {
-        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else { return [] }
-        let bg = snapshot.glucose
-        var met = Set<WatchAlertType>()
-        if bg <= thresholds.urgentLow { met.insert(.urgentLow) }
-        if bg < thresholds.low { met.insert(.lowBG) }
-        if bg > thresholds.high { met.insert(.highBG) }
-        if let rate = snapshot.deltaRate {
-            if rate < -thresholds.dropRate { met.insert(.fastDrop) }
-            if rate > thresholds.riseRate { met.insert(.fastRise) }
-        }
-        return met
-    }
-
-    /// Ends the alarms that are snoozed or whose threshold is no longer met. Over by itself, an
-    /// alarm keeps its first notification as a record; its repeats go.
-    private func closeAnswered(met: Set<WatchAlertType>) {
-        for type in openAlarms where !met.contains(type) || isSnoozed(for: type) {
-            setOpen(type, false)
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: repeatIDs(for: type))
-        }
-    }
-
-    /// Schedules the next stretch of repeats for the most urgent alarm still sounding, in place of
-    /// any scheduled before. Without a reading since launch it leaves those already scheduled.
-    private func scheduleRepeats() {
-        guard let reading = lastReading else { return }
-        let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: WatchAlertType.allCases.flatMap(repeatIDs(for:)))
-        guard let type = Self.repeatPriority.first(where: { isOpen($0) && !isSnoozed(for: $0) }) else { return }
-        for (index, id) in repeatIDs(for: type).enumerated() {
-            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: Self.repeatInterval * Double(index + 1), repeats: false)
-            center.add(UNNotificationRequest(identifier: id, content: content(for: type, bg: reading.bg, delta: reading.delta), trigger: trigger))
-        }
-        os_log("WatchAlertManager: %{public}@ repeats every %ds", log: alertLog, type: .info, type.rawValue, Int(Self.repeatInterval))
-    }
-
-    /// For the page: the alarms changed.
-    private func notifyChanged() {
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .watchAlarmsChanged, object: nil)
-        }
-    }
-
-    /// Stop: the alarm stops sounding and comes back a full cooldown after the Stop, if its
-    /// threshold is still met then. An urgent low covers a low, so stopping it stops both. The
-    /// next most urgent alarm still sounding takes over the repeats.
-    func stop(type: WatchAlertType) {
-        alertQueue.sync {
-            let stopped: [WatchAlertType] = type == .urgentLow ? [.urgentLow, .lowBG] : [type]
-            // A Stop on an old notification, of an alarm already over, starts no cooldown.
-            if isOpen(type) {
-                let now = Date().timeIntervalSince1970
-                stopped.forEach { defaults.set(now, forKey: $0.cooldownKey) }
-            }
-            stopped.forEach { setOpen($0, false) }
-            let center = UNUserNotificationCenter.current()
-            center.removePendingNotificationRequests(withIdentifiers: stopped.flatMap(repeatIDs(for:)))
-            center.removeDeliveredNotifications(withIdentifiers: stopped.flatMap(notificationIDs(for:)))
-            scheduleRepeats()
-        }
-        notifyChanged()
-        os_log("WatchAlertManager: stopped %{public}@", log: alertLog, type: .info, type.rawValue)
-    }
-
     /// App Group defaults — shared with main app target.
     private let defaults = UserDefaults(suiteName: AppGroupID.current()) ?? .standard
 
-    // MARK: - Snooze
-
-    /// The snooze of every alert, which doesn't reach urgent low: that's snoozed only on its own,
-    /// or by a snooze of everything while it's sounding.
-    private func globalSnooze(for type: WatchAlertType) -> TimeInterval {
-        type == .urgentLow ? 0 : defaults.double(forKey: globalSnoozeKey)
+    private enum Key {
+        /// The phone's latest alarm state, and when the phone sent it.
+        static let state = "watchAlarmState"
+        static let sentAt = "watchAlarmStateSentAt"
+        /// The sounding last alerted for, kept once it's over, and when its first notification went out.
+        static let alerted = "watchAlarmAlerted"
+        static let alertedAt = "watchAlarmAlertedAt"
+        /// The soundings answered here, newest last.
+        static let answered = "watchAlarmAnswered"
     }
 
-    /// Returns true if this alert type is currently suppressed (global OR per-type snooze active).
-    func isSnoozed(for type: WatchAlertType) -> Bool {
-        let now = Date().timeIntervalSince1970
-        let global = globalSnooze(for: type)
-        let perType = defaults.double(forKey: type.snoozeKey)
-        return now < global || now < perType
+    // MARK: - Repeating
+
+    /// An alarm keeps alerting until it's answered or the phone ends it, as the phone's sound
+    /// repeats: its notification, and the tap with it, comes again this often.
+    private static let repeatInterval: TimeInterval = 10
+    /// How far past the phone's latest word the repeats run. The phone says what's sounding with
+    /// every reading, so they go on for as long as the alarm is unanswered there, and stop soon
+    /// after the phone goes quiet. watchOS keeps only an app's next 64 notifications, so this
+    /// holds the repeats to 48.
+    private static let repeatWindow: TimeInterval = 8 * 60
+    /// Only one alarm sounds at a time, so the repeats have the same ids whichever it is.
+    private static let repeatIDs = (1 ... Int(repeatWindow / repeatInterval)).map { "lf-alarm-r\($0)" }
+    /// How many answered soundings are remembered, so a state the phone sent before it heard of
+    /// the answer doesn't bring one back.
+    private static let answeredLimit = 8
+
+    /// The alarm's first notification: one id per alarm, so a new sounding of it replaces the last.
+    private static func notificationID(for id: UUID) -> String {
+        "lf-alarm-\(id.uuidString)"
     }
 
-    /// Returns the latest active snooze expiry for this type (global or per-type), or nil.
-    func snoozeUntil(for type: WatchAlertType) -> Date? {
-        let now = Date().timeIntervalSince1970
-        let global = globalSnooze(for: type)
-        let perType = defaults.double(forKey: type.snoozeKey)
-        let until = max(global, perType)
-        return until > now ? Date(timeIntervalSince1970: until) : nil
+    // MARK: - Stored state, on alertQueue
+
+    private var state: WatchAlarmState? {
+        get { defaults.data(forKey: Key.state).flatMap { try? WatchAlarmState.decoded(from: $0) } }
+        set { defaults.set(newValue.flatMap { try? $0.encoded() }, forKey: Key.state) }
     }
 
-    /// True only if the global (all-types) snooze is currently active.
-    var isGloballySnoozed: Bool {
-        defaults.double(forKey: globalSnoozeKey) > Date().timeIntervalSince1970
+    private var sentAt: TimeInterval {
+        get { defaults.double(forKey: Key.sentAt) }
+        set { defaults.set(newValue, forKey: Key.sentAt) }
     }
 
-    /// Expiry date of the global snooze, or nil if not active.
-    var globalSnoozeExpiryDate: Date? {
-        let until = defaults.double(forKey: globalSnoozeKey)
-        let now = Date().timeIntervalSince1970
-        return until > now ? Date(timeIntervalSince1970: until) : nil
+    private var alerted: Sounding? {
+        get { defaults.data(forKey: Key.alerted).flatMap { try? JSONDecoder().decode(Sounding.self, from: $0) } }
+        set { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) }, forKey: Key.alerted) }
     }
 
-    /// Snooze. Pass nil type for global snooze; pass a specific type for per-type snooze. An urgent
-    /// low covers a low, so snoozing it snoozes both; a snooze of everything leaves urgent low able
-    /// to sound unless it's sounding now. The snoozed alarms stop, and their notifications are
-    /// cleared away as answered; any other alarm still sounding keeps repeating.
-    func snooze(minutes: Int, type: WatchAlertType?) {
-        let until = Date().timeIntervalSince1970 + Double(minutes * 60)
-        alertQueue.sync {
-            if let type {
-                let snoozed: [WatchAlertType] = type == .urgentLow ? [.urgentLow, .lowBG] : [type]
-                snoozed.forEach { defaults.set(until, forKey: $0.snoozeKey) }
-                os_log("WatchAlertManager: snoozed %{public}@ for %d min", log: alertLog, type: .info, type.rawValue, minutes)
-            } else {
-                defaults.set(until, forKey: globalSnoozeKey)
-                if isOpen(.urgentLow) {
-                    defaults.set(until, forKey: WatchAlertType.urgentLow.snoozeKey)
-                }
-                os_log("WatchAlertManager: snoozed all for %d min", log: alertLog, type: .info, minutes)
-            }
-            let snoozed = WatchAlertType.allCases.filter { isSnoozed(for: $0) }
-            snoozed.forEach { setOpen($0, false) }
-            let center = UNUserNotificationCenter.current()
-            center.removePendingNotificationRequests(withIdentifiers: snoozed.flatMap(repeatIDs(for:)))
-            center.removeDeliveredNotifications(withIdentifiers: snoozed.flatMap(notificationIDs(for:)))
-            scheduleRepeats()
-        }
-        notifyChanged()
+    private var alertedAt: TimeInterval {
+        get { defaults.double(forKey: Key.alertedAt) }
+        set { defaults.set(newValue, forKey: Key.alertedAt) }
     }
 
-    /// Cancel snooze. Nil clears only the global snooze; specific type clears only that type.
-    /// Per-type snoozes set from notification actions are not affected by a nil cancel.
-    func cancelSnooze(type: WatchAlertType?) {
-        if let type = type {
-            defaults.set(0, forKey: type.snoozeKey)
-        } else {
-            defaults.set(0, forKey: globalSnoozeKey)
-        }
-        os_log("WatchAlertManager: snooze cancelled", log: alertLog, type: .info)
-        notifyChanged()
+    private var answered: [String] {
+        get { defaults.stringArray(forKey: Key.answered) ?? [] }
+        set { defaults.set(Array(newValue.suffix(Self.answeredLimit)), forKey: Key.answered) }
+    }
+
+    /// The latest reading that came with the phone's alarm state, which the notification shows
+    /// before the store has it.
+    private var reading: GlucoseSnapshot?
+
+    /// The alarm sounding on the phone and unanswered here.
+    private func soundingNow(at now: TimeInterval = Date().timeIntervalSince1970) -> Sounding? {
+        state?.soundingToAlert(sentAt: sentAt, answered: answered, now: now)
     }
 
     // MARK: - Setup (call once from applicationDidFinishLaunching)
 
     func setup() {
         UNUserNotificationCenter.current().delegate = self
-        registerNotificationCategories()
+        removeRetiredAlerts()
         // Sound, so an alarm can be heard like the phone's; a watch in silent mode still taps.
         UNUserNotificationCenter.current().requestAuthorization(
             options: [.alert, .sound, .badge]
@@ -288,168 +119,337 @@ final class WatchAlertManager: NSObject {
         }
     }
 
+    /// Clears away the alerts the Watch raised itself before it mirrored the phone's: repeats still
+    /// to come, and those already shown.
+    private func removeRetiredAlerts() {
+        let center = UNUserNotificationCenter.current()
+        let isRetired: (String) -> Bool = { $0.hasPrefix("lf-alert-") }
+        center.getPendingNotificationRequests { requests in
+            center.removePendingNotificationRequests(withIdentifiers: requests.map(\.identifier).filter(isRetired))
+        }
+        center.getDeliveredNotifications { notifications in
+            center.removeDeliveredNotifications(withIdentifiers: notifications.map(\.request.identifier).filter(isRetired))
+        }
+    }
+
+    // MARK: - Actions
+
+    private enum Action {
+        /// Snooze for the alarm's own length, as the phone's notification does.
+        static let snooze = "ALARM_SNOOZE"
+        /// Choose how long, on the snooze screen.
+        static let chooseSnooze = "ALARM_SNOOZE_CHOOSE"
+        /// Stop without a snooze, as the phone's Acknowledge does.
+        static let stop = "ALARM_STOP"
+    }
+
+    /// An alarm's notification offers what the phone's snooze screen allows for it: a snooze of its
+    /// own length unless that's 0, a choice of length when there is one, and Stop when it can be
+    /// stopped without a snooze. There's a category for each mix.
+    private static func category(snooze: Bool, choose: Bool, stop: Bool) -> String {
+        "LF_ALARM_\(snooze ? "S" : "")\(choose ? "C" : "")\(stop ? "X" : "")"
+    }
+
+    private static func category(for sounding: Sounding) -> String {
+        category(snooze: sounding.snoozesByDefault, choose: sounding.canChooseSnooze, stop: sounding.canAcknowledge)
+    }
+
     private func registerNotificationCategories() {
-        // Snooze for the snooze screen's default length in one tap, or choose on it.
-        let snoozeDefault = UNNotificationAction(
-            identifier: "SNOOZE_DEFAULT",
-            title: "Snooze \(settings.defaultSnoozeMinutes) min",
-            options: []
-        )
-        let snooze = UNNotificationAction(
-            identifier: "SNOOZE_ALERT",
-            title: "Snooze…",
-            options: [.foreground]
-        )
-        // Stops this alarm repeating; it can come back after its cooldown.
-        let stop = UNNotificationAction(
-            identifier: "DISMISS_ALERT",
-            title: "Stop",
-            options: []
-        )
-        let category = UNNotificationCategory(
-            identifier: "GLUCOSE_ALERT",
-            actions: [snoozeDefault, snooze, stop],
-            intentIdentifiers: [],
-            options: []
-        )
-        UNUserNotificationCenter.current().setNotificationCategories([category])
-    }
-
-    // MARK: - Active alert query
-
-    /// The alerts whose thresholds the snapshot meets, weighed as `checkAndAlert` weighs them,
-    /// regardless of cooldown or snooze.
-    func triggeredAlerts(for snapshot: GlucoseSnapshot) -> [WatchAlertType] {
-        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else { return [] }
-        let bg = snapshot.glucose
-        let delta = snapshot.deltaRate
-        if bg <= thresholds.urgentLow { return [.urgentLow] }
-        if bg < thresholds.low { return [.lowBG] }
-        var types: [WatchAlertType] = []
-        if bg > thresholds.high { types.append(.highBG) }
-        if delta.map({ $0 < -thresholds.dropRate }) ?? false { types.append(.fastDrop) }
-        if delta.map({ $0 > thresholds.riseRate }) ?? false { types.append(.fastRise) }
-        return types
-    }
-
-    /// What the glucose page offers for the alerts.
-    enum SnoozeStatus: Equatable {
-        case none
-        /// An alarm is sounding, unanswered: Snooze and Stop buttons.
-        case active
-        /// Alerts are snoozed until then: a Cancel button.
-        case snoozed(until: Date)
-    }
-
-    func snoozeStatus(for snapshot: GlucoseSnapshot?) -> SnoozeStatus {
-        // A sounding alarm first, so it can always be snoozed or stopped.
-        if !openAlarms.isEmpty { return .active }
-        // A snooze of every alert shows whatever BG is doing, so it can always be cancelled.
-        if let until = globalSnoozeExpiryDate { return .snoozed(until: until) }
-        // Each alert met is snoozed on its own, from its notification.
-        let met = snapshot.map(metAlerts(for:)) ?? []
-        if let until = met.compactMap({ snoozeUntil(for: $0) }).max() { return .snoozed(until: until) }
-        return .none
-    }
-
-    /// Stops every sounding alarm, as Stop on each of their notifications would.
-    func stopAll() {
-        let sounding = alertQueue.sync { openAlarms }
-        sounding.forEach(stop(type:))
-    }
-
-    /// Ends every snooze, of all alerts and of each on its own, so alerts sound again when met.
-    func cancelAllSnoozes() {
-        defaults.set(0, forKey: globalSnoozeKey)
-        for type in WatchAlertType.allCases {
-            defaults.set(0, forKey: type.snoozeKey)
-        }
-        os_log("WatchAlertManager: all snoozes cancelled", log: alertLog, type: .info)
-        notifyChanged()
-    }
-
-    // MARK: - Check (main entry point — call from both WC and background refresh paths)
-
-    func checkAndAlert(snapshot: GlucoseSnapshot) {
-        // Staleness gate: cheap read with no shared state — keep outside the serial queue.
-        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else {
-            os_log("WatchAlertManager: snapshot too stale, skipping", log: alertLog, type: .debug)
-            return
-        }
-
-        alertQueue.sync {
-            let before = openAlarms
-            let bg = snapshot.glucose
-            let delta = snapshot.deltaRate
-            lastReading = (bg, delta)
-            // Urgent low alone when met; low keeps fast drop quiet.
-            for type in triggeredAlerts(for: snapshot) {
-                evaluate(type, bg: bg, delta: delta)
+        let snooze = UNNotificationAction(identifier: Action.snooze, title: "Snooze", options: [])
+        let choose = UNNotificationAction(identifier: Action.chooseSnooze, title: "Snooze…", options: [.foreground])
+        // Stops it now; it sounds again if the phone finds it still due.
+        let stop = UNNotificationAction(identifier: Action.stop, title: "Stop", options: [])
+        let flags = [false, true]
+        var categories = Set<UNNotificationCategory>()
+        for s in flags {
+            for c in flags {
+                for x in flags {
+                    categories.insert(UNNotificationCategory(
+                        identifier: Self.category(snooze: s, choose: c, stop: x),
+                        actions: [s ? snooze : nil, c ? choose : nil, x ? stop : nil].compactMap { $0 },
+                        intentIdentifiers: [],
+                        options: []
+                    ))
+                }
             }
-            closeAnswered(met: metAlerts(for: snapshot))
-            scheduleRepeats()
-            if openAlarms != before { notifyChanged() }
         }
+        UNUserNotificationCenter.current().setNotificationCategories(categories)
     }
 
-    /// For a reading the Watch fetched from Nightscout itself: ends the alarms it no longer meets
-    /// and keeps the rest repeating, but starts none, as its rate of change can span a missed
-    /// reading.
-    func resolve(snapshot: GlucoseSnapshot) {
-        guard snapshot.updatedAt > Date(timeIntervalSinceNow: -15 * 60) else { return }
-        alertQueue.sync {
-            let before = openAlarms
-            lastReading = (snapshot.glucose, snapshot.deltaRate)
-            closeAnswered(met: metAlerts(for: snapshot))
-            scheduleRepeats()
-            if openAlarms != before { notifyChanged() }
+    // MARK: - From the phone
+
+    /// Takes the phone's alarm state, sent at `sentAt` with `reading`: alerts for an alarm that has
+    /// started sounding, keeps one still sounding repeating, and ends one the phone has ended. A
+    /// state sent before the one already taken is ignored, as a late copy from a slower channel.
+    func apply(_ incoming: WatchAlarmState, sentAt incomingSentAt: TimeInterval, reading incomingReading: GlucoseSnapshot? = nil) {
+        let changed: Bool = alertQueue.sync {
+            if let incomingReading, incomingReading.updatedAt > (reading?.updatedAt ?? .distantPast) {
+                reading = incomingReading
+            }
+            // A time well ahead of this clock came from a phone clock that was later set back, and
+            // must not hold off every state until real time catches up with it.
+            let latest = sentAt <= Date().timeIntervalSince1970 + 300 ? sentAt : 0
+            guard incomingSentAt >= latest else { return false }
+            let before = (state, soundingNow())
+            state = incoming
+            sentAt = incomingSentAt
+            update()
+            return before.0 != incoming || before.1 != soundingNow()
         }
+        if changed { notifyChanged() }
     }
 
-    // MARK: - Private
-
-    /// Fires an alarm whose threshold is met, unless it's snoozed, already sounding or cooling down.
-    private func evaluate(_ type: WatchAlertType, bg: Double, delta: Double?) {
-        guard !isSnoozed(for: type), !isOpen(type) else { return }
-
+    /// Brings the notifications in line with the phone's state: the alarm sounding there alerted for
+    /// once, and repeating while the phone repeats it; the one alerted for before it, ended. Ended by
+    /// a snooze on the phone, an alarm's notification is cleared away as answered; over by itself,
+    /// it stays as a record. On `alertQueue`.
+    private func update() {
         let now = Date().timeIntervalSince1970
-        let lastFired = defaults.double(forKey: type.cooldownKey)
-        guard now - lastFired >= settings.cooldown(for: type) else { return }
-
-        fire(type: type, bg: bg, delta: delta)
-        defaults.set(now, forKey: type.cooldownKey)
-        setOpen(type, true)
+        let center = UNUserNotificationCenter.current()
+        let current = soundingNow(at: now)
+        if let previous = alerted, previous.key != current?.key {
+            center.removePendingNotificationRequests(withIdentifiers: Self.repeatIDs)
+            center.removeDeliveredNotifications(withIdentifiers: Self.repeatIDs)
+            if previous.id != current?.id, state?.snoozedUntil(previous.id, now: now) != nil {
+                center.removeDeliveredNotifications(withIdentifiers: [Self.notificationID(for: previous.id)])
+            }
+        }
+        guard let current else { return }
+        if current.key != alerted?.key {
+            alerted = current
+            alertedAt = now
+            post(current)
+        }
+        scheduleRepeats(for: current, now: now)
     }
 
-    /// An alarm's notification, the first and each repeat alike.
-    private func content(for type: WatchAlertType, bg: Double, delta: Double?) -> UNMutableNotificationContent {
-        let content = UNMutableNotificationContent()
-        content.title = type.title
-        content.body = type.body(bg: bg, delta: delta)
-        content.sound = .default
-        content.interruptionLevel = (type == .urgentLow) ? .timeSensitive : .active
-        content.categoryIdentifier = "GLUCOSE_ALERT"
-        // Its repeats gather under it in Notification Center.
-        content.threadIdentifier = type.notificationID
-        // Which alarm it is, whichever of its notifications is answered.
-        content.userInfo = ["alertType": type.rawValue]
-        return content
-    }
-
-    private func fire(type: WatchAlertType, bg: Double, delta: Double?) {
+    /// The alarm's first notification, at once.
+    private func post(_ sounding: Sounding) {
         let request = UNNotificationRequest(
-            identifier: type.notificationID, // stable ID — replaces any pending same-type alert
-            content: content(for: type, bg: bg, delta: delta),
+            identifier: Self.notificationID(for: sounding.id),
+            content: content(for: sounding),
             trigger: nil // immediate delivery
         )
         UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
+            if let error {
                 os_log("WatchAlertManager: failed %{public}@ — %{public}@",
-                       log: alertLog, type: .error, type.rawValue, error.localizedDescription)
+                       log: alertLog, type: .error, sounding.name, error.localizedDescription)
             } else {
-                os_log("WatchAlertManager: fired %{public}@ bg=%d",
-                       log: alertLog, type: .info, type.rawValue, Int(bg))
+                os_log("WatchAlertManager: alerted %{public}@", log: alertLog, type: .info, sounding.name)
             }
+        }
+    }
+
+    /// Schedules the repeats due before `repeatWindow` past the phone's latest word, every
+    /// `repeatInterval` from the first notification, in place of those scheduled before; none while
+    /// the phone isn't repeating its sound.
+    private func scheduleRepeats(for sounding: Sounding, now: TimeInterval) {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: Self.repeatIDs)
+        guard sounding.playsSound, sounding.repeats else { return }
+        let end = min(sentAt, now) + Self.repeatWindow
+        let content = content(for: sounding)
+        // On the alarm's own beat, so word from the phone doesn't put the next repeat off.
+        var next = alertedAt + Self.repeatInterval * ((max(0, now - alertedAt) / Self.repeatInterval).rounded(.down) + 1)
+        for id in Self.repeatIDs {
+            guard next <= end else { break }
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, next - now), repeats: false)
+            center.add(UNNotificationRequest(identifier: id, content: content, trigger: trigger))
+            next += Self.repeatInterval
+        }
+    }
+
+    /// An alarm's notification, the first and each repeat alike.
+    private func content(for sounding: Sounding) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.title = sounding.name
+        content.body = latestReading()
+        content.sound = .default
+        // Sounding out loud on the phone, it comes through a Focus here too.
+        content.interruptionLevel = sounding.playsSound ? .timeSensitive : .active
+        content.categoryIdentifier = Self.category(for: sounding)
+        // Its repeats gather under it in Notification Center.
+        content.threadIdentifier = Self.notificationID(for: sounding.id)
+        // Which alarm it is, whichever of its notifications is answered.
+        content.userInfo = ["alarmID": sounding.id.uuidString]
+        return content
+    }
+
+    /// The latest reading, as the phone's alarm notification gives it: the one that came with the
+    /// alarm, which the store can still be saving, or the one stored; nothing once it's too old to
+    /// show. On `alertQueue`.
+    private func latestReading() -> String {
+        guard let s = [reading, GlucoseSnapshotStore.shared.load()].compactMap({ $0 }).max(by: { $0.updatedAt < $1.updatedAt }),
+              s.updatedAt > Date(timeIntervalSinceNow: -15 * 60)
+        else { return "" }
+        return "\(WatchFormat.glucose(s)) \(WatchFormat.trendArrow(s)) \(WatchFormat.delta(s))"
+    }
+
+    // MARK: - Answering
+
+    /// Snoozes the alarm on the phone for `units` of its snooze time, or its own length when nil, as
+    /// the phone's snooze screen would; 0 stops it. It stops alerting here at once. `completion`
+    /// runs once the snooze is on its way, on the main queue.
+    /// Snoozes the alarm on the phone for `units` of its snooze time, or its own length when nil, as
+    /// the phone's snooze screen would; 0 stops it. It stops alerting here at once. Once the Watch
+    /// knows the sounding is over, the snooze only clears its notifications away: an older
+    /// notification's Snooze answers nothing, as on the phone. `completion` runs once the snooze is
+    /// on its way, on the main queue.
+    func snooze(_ sounding: Sounding, units: Int?, completion: (() -> Void)? = nil) {
+        let isSounding: Bool = alertQueue.sync {
+            let isSounding = soundingNow()?.key == sounding.key
+            answer(sounding)
+            // Snoozed for the glucose page until the phone says so itself.
+            let duration = sounding.snoozeDuration(units: units ?? sounding.snoozeUnits)
+            if isSounding, duration > 0, var s = state {
+                s.snoozes = s.snoozes.filter { $0.id != sounding.id }
+                    + [WatchAlarmState.Snooze(id: sounding.id, until: Date().timeIntervalSince1970 + duration)]
+                state = s
+            }
+            return isSounding
+        }
+        notifyChanged()
+        guard isSounding else {
+            DispatchQueue.main.async { completion?() }
+            return
+        }
+        send(.snooze(Self.answer(to: sounding), units: units), completion: completion)
+    }
+
+    /// Stops the alarm on the phone without a snooze, as its Acknowledge does. It stops alerting here
+    /// at once; once the Watch knows the sounding is over, the stop only clears its notifications
+    /// away. `completion` runs once the stop is on its way, on the main queue.
+    func stop(_ sounding: Sounding, completion: (() -> Void)? = nil) {
+        let isSounding: Bool = alertQueue.sync {
+            let isSounding = soundingNow()?.key == sounding.key
+            answer(sounding)
+            return isSounding
+        }
+        notifyChanged()
+        guard isSounding else {
+            DispatchQueue.main.async { completion?() }
+            return
+        }
+        send(.stop(Self.answer(to: sounding)), completion: completion)
+    }
+
+    /// The answer to the sounding, given now.
+    private static func answer(to sounding: Sounding) -> WatchAlarmCommand.Answer {
+        WatchAlarmCommand.Answer(id: sounding.id, since: sounding.since, issuedAt: Date().timeIntervalSince1970)
+    }
+
+    /// The glucose page's Stop, for the alarm sounding, when it can be stopped without a snooze.
+    func stopSounding() {
+        guard let sounding = currentSounding(), sounding.canAcknowledge else { return }
+        stop(sounding)
+    }
+
+    /// Ends the snoozes the glucose page shows, on the phone: Snooze All, and the snooze of the alarm
+    /// that last sounded here.
+    func cancelSnoozes() {
+        let command: WatchAlarmCommand = alertQueue.sync {
+            let id = alerted?.id
+            let until = state?.snoozes.first { $0.id == id }?.until
+            let allUntil = state?.snoozedAllUntil
+            if var s = state {
+                s.snoozedAllUntil = nil
+                s.snoozes.removeAll { $0.id == id }
+                state = s
+            }
+            // The snoozes as shown, so the phone ends those and no other set since.
+            return .cancelSnoozes(id: id, until: until, allUntil: allUntil)
+        }
+        notifyChanged()
+        send(command)
+    }
+
+    /// The sounding is answered here: it stops alerting, and its notifications are cleared away,
+    /// unless a later sounding of the same alarm has taken them over, which the phone may still be
+    /// sounding. On `alertQueue`.
+    private func answer(_ sounding: Sounding) {
+        answered = answered.filter { $0 != sounding.key } + [sounding.key]
+        let center = UNUserNotificationCenter.current()
+        if alerted?.key == sounding.key {
+            center.removePendingNotificationRequests(withIdentifiers: Self.repeatIDs)
+            center.removeDeliveredNotifications(withIdentifiers: Self.repeatIDs)
+        }
+        if alerted?.id != sounding.id || alerted?.key == sounding.key {
+            center.removeDeliveredNotifications(withIdentifiers: [Self.notificationID(for: sounding.id)])
+        }
+        os_log("WatchAlertManager: answered %{public}@", log: alertLog, type: .info, sounding.name)
+    }
+
+    /// Sends a command to the phone: at once when it can be reached, otherwise queued until it can.
+    /// `completion` runs once it's handed to WatchConnectivity, on the main queue.
+    private func send(_ command: WatchAlarmCommand, completion: (() -> Void)? = nil) {
+        guard let data = try? command.encoded() else {
+            DispatchQueue.main.async { completion?() }
+            return
+        }
+        let message: [String: Any] = [WatchAlarmCommand.payloadKey: data]
+        // A notification's action can launch the app before WatchConnectivity is ready.
+        WatchSessionReceiver.shared.whenActivated { activated in
+            defer { completion?() }
+            guard activated else {
+                os_log("WatchAlertManager: WatchConnectivity inactive, command not sent", log: alertLog, type: .error)
+                return
+            }
+            let session = WCSession.default
+            if session.isReachable {
+                session.sendMessage(message, replyHandler: nil) { _ in session.transferUserInfo(message) }
+            } else {
+                session.transferUserInfo(message)
+            }
+        }
+    }
+
+    // MARK: - For the pages
+
+    /// What the glucose page offers for the alarms.
+    enum SnoozeStatus: Equatable {
+        case none
+        /// An alarm is sounding, unanswered: Snooze, and Stop when it can be stopped without one.
+        case active(canStop: Bool)
+        /// Alarms are snoozed until then: a Cancel button.
+        case snoozed(until: Date)
+
+        var isActive: Bool {
+            if case .active = self { return true }
+            return false
+        }
+    }
+
+    func snoozeStatus() -> SnoozeStatus {
+        alertQueue.sync {
+            let now = Date().timeIntervalSince1970
+            // A sounding alarm first, so it can always be snoozed or stopped.
+            if let sounding = soundingNow(at: now) { return .active(canStop: sounding.canAcknowledge) }
+            // Snooze All, or the snooze of the alarm that last sounded here, so it can be cancelled.
+            if let until = state?.snoozedUntil(alerted?.id, now: now) {
+                return .snoozed(until: Date(timeIntervalSince1970: until))
+            }
+            return .none
+        }
+    }
+
+    /// The alarm sounding and unanswered, for the snooze screen.
+    func currentSounding() -> Sounding? {
+        alertQueue.sync { soundingNow() }
+    }
+
+    /// The alarm a notification is for, as it last sounded here, over or not, so a snooze from an
+    /// older notification still reaches it.
+    func sounding(for id: UUID) -> Sounding? {
+        alertQueue.sync {
+            if let current = soundingNow(), current.id == id { return current }
+            return alerted?.id == id ? alerted : nil
+        }
+    }
+
+    /// For the page: the alarms changed.
+    private func notifyChanged() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .watchAlarmsChanged, object: nil)
         }
     }
 }
@@ -462,36 +462,42 @@ extension WatchAlertManager: UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let request = response.notification.request
-        // From the notification itself; one posted before it carried its type, from its identifier.
-        let alertType = (request.content.userInfo["alertType"] as? String).flatMap(WatchAlertType.init(rawValue:))
-            ?? WatchAlertType.allCases.first { request.identifier.hasPrefix($0.notificationID) }
+        guard let id = (response.notification.request.content.userInfo["alarmID"] as? String)
+            .flatMap(UUID.init(uuidString:))
+        else {
+            completionHandler()
+            return
+        }
+        // The phone decides whether an answer to an alarm that's over still counts; one from before
+        // the alarm that last sounded here answers nothing, as on the phone.
+        guard let sounding = sounding(for: id) else {
+            completionHandler()
+            return
+        }
 
         switch response.actionIdentifier {
-        case "DISMISS_ALERT":
-            // Shown as Stop.
-            if let type = alertType { stop(type: type) }
+        case Action.snooze:
+            snooze(sounding, units: nil, completion: completionHandler)
 
-        case "SNOOZE_DEFAULT":
-            // Only the alarm answered, for the default length, as the phone's Snooze does.
-            // Snoozing everything is on the snooze screen, where it says so.
-            if let type = alertType {
-                snooze(minutes: settings.defaultSnoozeMinutes, type: type)
-            }
+        case Action.stop:
+            stop(sounding, completion: completionHandler)
 
-        case "SNOOZE_ALERT":
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(
-                    name: .showSnoozeSheet,
-                    object: nil,
-                    userInfo: alertType.map { ["alertType": $0.rawValue] }
-                )
+        case Action.chooseSnooze:
+            // Only while it's sounding: there's nothing left to snooze once it's over.
+            if currentSounding()?.key == sounding.key {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: .showSnoozeSheet,
+                        object: nil,
+                        userInfo: ["alarmID": id.uuidString]
+                    )
+                }
             }
+            completionHandler()
 
         default:
-            break
+            completionHandler()
         }
-        completionHandler()
     }
 
     func userNotificationCenter(

@@ -30,6 +30,21 @@ final class WatchConnectivityManager: NSObject {
     private var refreshBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// Settings most recently handed to WatchConnectivity, used to skip redundant pushes.
     private var lastSentSettings: WatchSettings?
+    /// The alarm state most recently handed to WatchConnectivity, likewise.
+    private var lastSentAlarmState: WatchAlarmState?
+    /// When the payload went out that took the last alarm start or end on the high-priority
+    /// channel, so a later send doesn't cancel it while it's still on its way.
+    private var urgentAlarmSentAt: TimeInterval?
+    /// When the latest payload went out, so a failed live message that has been overtaken isn't
+    /// queued after it.
+    private var latestAlarmsSentAt: TimeInterval?
+    /// The sounding last answered from the Watch, whose end the Watch already knows of.
+    private var answeredFromWatch: String?
+    /// While an alarm sounds, unchanged state still goes out this often, so the Watch keeps
+    /// repeating it for as long as the phone does, within its 8 minutes of repeats.
+    private static let soundingResendInterval: TimeInterval = 4 * 60
+    /// Checks for that resend while an alarm sounds; nil otherwise.
+    private var soundingResendTimer: Timer?
     /// What the last snapshot send carried, and when. The phone refreshes far more often than
     /// anything changes, and every send can wake the Watch, so an identical send is skipped.
     private var lastSentContent: SentContent?
@@ -53,6 +68,7 @@ final class WatchConnectivityManager: NSObject {
         WCSession.default.delegate = self
         WCSession.default.activate()
         observeWatchSettings()
+        observeAlarms()
         LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: WCSession activation requested")
     }
 
@@ -77,6 +93,17 @@ final class WatchConnectivityManager: NSObject {
             pumpAgeColoring: Self.ageColoring(for: .cage),
             sensorAgeColoring: Self.ageColoring(for: .sage),
             trioRemote: remoteSystem == .trio ? Self.trioRemote() : nil
+        )
+    }
+
+    /// The phone's alarms, which the Watch mirrors. Call on the main thread.
+    private func currentAlarmState(now: Date = Date()) -> WatchAlarmState {
+        WatchAlarmState.make(
+            alarms: Storage.shared.alarms.value,
+            config: Storage.shared.alarmConfiguration.value,
+            sounding: AlarmManager.shared.sounding,
+            currentAlarm: Observable.shared.currentAlarm.value,
+            now: now
         )
     }
 
@@ -125,6 +152,7 @@ final class WatchConnectivityManager: NSObject {
     /// only compares it with the newest reading, and a new reading brings it along.
     private struct SentContent: Equatable {
         let settings: WatchSettings
+        let alarms: WatchAlarmState
         let snapshot: GlucoseSnapshot
         let newestReading: TimeInterval?
         let readingCount: Int
@@ -136,6 +164,7 @@ final class WatchConnectivityManager: NSObject {
         let readings = Thread.isMainThread ? MainViewController.shared?.bgData ?? [] : []
         return SentContent(
             settings: currentSettings(),
+            alarms: currentAlarmState(now: now),
             snapshot: snapshot,
             newestReading: readings.last?.date,
             readingCount: readings.count,
@@ -158,8 +187,15 @@ final class WatchConnectivityManager: NSObject {
         if let snapshot, let data = try? encode(snapshot) {
             payload["snapshot"] = data
         }
-        let readings = currentReadings()
         let now = Date()
+        let alarms = currentAlarmState(now: now)
+        if let data = try? alarms.encoded() {
+            payload[WatchAlarmState.payloadKey] = data
+            payload[WatchAlarmState.sentAtKey] = now.timeIntervalSince1970
+            lastSentAlarmState = alarms
+            latestAlarmsSentAt = now.timeIntervalSince1970
+        }
+        let readings = currentReadings()
         if !readings.isEmpty, let data = try? WatchGlucoseHistory.make(from: readings, now: now).encoded() {
             payload[WatchGlucoseHistory.payloadKey] = data
         }
@@ -303,7 +339,8 @@ final class WatchConnectivityManager: NSObject {
     /// Call on the main thread so the payload includes the BG readings.
     /// Skips quietly when there is no Watch app, and when nothing has changed since the last
     /// send unless `force` is set; a forced resend of unchanged state goes out as a live
-    /// message only, since the Watch already has the rest.
+    /// message only, since the Watch already has the rest. An alarm starting or ending takes the
+    /// high-priority channel whenever any of its daily budget is left.
     func send(snapshot: GlucoseSnapshot, force: Bool = false) {
         guard WCSession.isSupported(), StorageReadiness.ready.value else { return }
 
@@ -313,8 +350,17 @@ final class WatchConnectivityManager: NSObject {
 
         let now = Date()
         let content = sentContent(snapshot: snapshot, now: now)
-        let unchanged = content == lastSentContent && now.timeIntervalSince(lastSentAt) < Self.resendInterval
+        // An alarm state the Watch had in a reply, or with the settings, counts too, so a change
+        // back to what the last send carried still goes out.
+        let resendInterval = content.alarms.sounding == nil ? Self.resendInterval : Self.soundingResendInterval
+        let unchanged = content == lastSentContent && content.alarms == lastSentAlarmState
+            && now.timeIntervalSince(lastSentAt) < resendInterval
         if unchanged, !force { return }
+        // The Watch should sound, or fall quiet, with the phone; an end the Watch caused itself, by
+        // a snooze or stop, it knows of already.
+        let previous = lastSentContent?.alarms.sounding
+        let alarmStartedOrEnded = content.alarms.sounding?.key != previous?.key
+        let urgent = alarmStartedOrEnded && !(content.alarms.sounding == nil && previous?.key == answeredFromWatch)
 
         let payload = makePayload(snapshot: snapshot)
         guard payload["snapshot"] != nil else {
@@ -328,16 +374,30 @@ final class WatchConnectivityManager: NSObject {
             LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK is \(Int(behindBy))s behind — Watch may be missing deliveries")
         }
 
-        // The Watch app is open: deliver now, and queue it only if that fails.
+        // The Watch app is open: deliver now, and queue it only if that fails; an alarm starting
+        // or ending, on the faster channel.
         if session.isReachable {
-            session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in session.transferUserInfo(payload) })
+            let sentAt = payload[WatchAlarmState.sentAtKey] as? TimeInterval
+            session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in
+                DispatchQueue.main.async {
+                    // A later payload has gone out since and carries all of this.
+                    guard sentAt == self.latestAlarmsSentAt else { return }
+                    if urgent, session.isComplicationEnabled, session.remainingComplicationUserInfoTransfers > 0 {
+                        self.urgentAlarmSentAt = sentAt
+                        session.transferCurrentComplicationUserInfo(payload)
+                    } else {
+                        session.transferUserInfo(payload)
+                    }
+                }
+            })
         }
         guard !unchanged else { return }
 
         // Only the latest state matters, so a queued older one is dropped; a queued bolus or
-        // carb confirmation is not.
+        // carb confirmation is not, nor an alarm's start or end still on its way on the faster
+        // channel, unless this send brings the next one.
         session.outstandingUserInfoTransfers
-            .filter { $0.userInfo["snapshot"] != nil }
+            .filter { $0.userInfo["snapshot"] != nil && (alarmStartedOrEnded || !isUrgentAlarmTransfer($0)) }
             .forEach { $0.cancel() }
 
         // applicationContext: always keep latest state for the app refresh path.
@@ -356,18 +416,23 @@ final class WatchConnectivityManager: NSObject {
         // complications. Otherwise:
         //   Every 30 min → transferCurrentComplicationUserInfo (high-priority wake, 50/day budget)
         //   Every  5 min → transferUserInfo (queued fallback, no documented cap)
-        // Outstanding transfers are cancelled above so at most one is ever pending.
+        // Outstanding transfers are cancelled above so at most one is ever pending, besides an
+        // alarm's start or end still on its way.
         guard !session.isReachable else { return }
         let transferLog: String
         if session.isComplicationEnabled,
            WatchRefreshPolicy.isComplicationPushDue(
                now: now,
                lastPush: lastComplicationPushTime,
-               remainingTransfers: session.remainingComplicationUserInfoTransfers
+               remainingTransfers: session.remainingComplicationUserInfoTransfers,
+               urgent: urgent
            )
         {
             session.transferCurrentComplicationUserInfo(payload)
             lastComplicationPushTime = now
+            if urgent {
+                urgentAlarmSentAt = payload[WatchAlarmState.sentAtKey] as? TimeInterval
+            }
             transferLog = "snapshot sent via transferCurrentComplicationUserInfo"
         } else {
             session.transferUserInfo(payload)
@@ -395,8 +460,10 @@ extension WatchConnectivityManager: WCSessionDelegate {
         }
     }
 
-    /// Receives ACKs from the Watch (sent after each snapshot is saved, in debug builds).
+    /// Receives ACKs from the Watch (sent after each snapshot is saved, in debug builds), and its
+    /// snoozes and stops of alarms.
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
+        if handleAlarmCommand(message) { return }
         if let ackTimestamp = message["watchAck"] as? TimeInterval {
             DispatchQueue.main.async { self.lastWatchAckTimestamp = ackTimestamp }
             LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK received for snapshot at \(ackTimestamp)", isDebug: true)
@@ -409,6 +476,10 @@ extension WatchConnectivityManager: WCSessionDelegate {
         didReceiveMessage message: [String: Any],
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
+        if handleAlarmCommand(message) {
+            replyHandler(["success": true])
+            return
+        }
         if message["watchRequestRefresh"] != nil {
             DispatchQueue.main.async {
                 let fetching = self.refreshForWatch()
@@ -435,6 +506,7 @@ extension WatchConnectivityManager: WCSessionDelegate {
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
+        if handleAlarmCommand(userInfo) { return }
         if let ackTimestamp = userInfo["watchAck"] as? TimeInterval {
             DispatchQueue.main.async { self.lastWatchAckTimestamp = ackTimestamp }
             LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: Watch ACK (userInfo) received for snapshot at \(ackTimestamp)", isDebug: true)
@@ -561,5 +633,85 @@ extension WatchConnectivityManager: WCSessionDelegate {
                 self?.pushSettingsIfChanged()
             }
             .store(in: &cancellables)
+    }
+
+    // MARK: - Alarms
+
+    /// Sends the alarm state as soon as it changes, rather than with the next reading: an alarm
+    /// starting, ending or snoozed, one turned on or off, or Snooze All set or ended.
+    private func observeAlarms() {
+        let changes: [AnyPublisher<Void, Never>] = [
+            Observable.shared.currentAlarm.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.alarms.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            Storage.shared.alarmConfiguration.$value.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+        ]
+        Publishers.MergeMany(changes)
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.pushAlarmStateIfChanged()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Whether a queued transfer is the high-priority one taking an alarm's start or end.
+    private func isUrgentAlarmTransfer(_ transfer: WCSessionUserInfoTransfer) -> Bool {
+        guard let urgentAlarmSentAt, transfer.isCurrentComplicationInfo else { return false }
+        return transfer.userInfo[WatchAlarmState.sentAtKey] as? TimeInterval == urgentAlarmSentAt
+    }
+
+    /// Sends everything, with the alarm state, when that differs from what last went out on every
+    /// channel, or from what last went out at all, as a reply to the Watch or with the settings.
+    private func pushAlarmStateIfChanged() {
+        guard StorageReadiness.ready.value else { return }
+        let state = currentAlarmState()
+        resendWhileSounding(state.sounding != nil)
+        guard state != lastSentContent?.alarms || state != lastSentAlarmState else { return }
+        if let snapshot = currentSnapshot() {
+            send(snapshot: snapshot)
+        } else {
+            pushSettings()
+        }
+    }
+
+    /// While an alarm sounds, offers the state to `send` every minute, which sends it again once
+    /// `soundingResendInterval` has passed with nothing else going out: a data outage can keep an
+    /// alarm such as Not Looping sounding with nothing changing.
+    private func resendWhileSounding(_ sounding: Bool) {
+        guard sounding else {
+            soundingResendTimer?.invalidate()
+            soundingResendTimer = nil
+            return
+        }
+        guard soundingResendTimer == nil else { return }
+        soundingResendTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self, StorageReadiness.ready.value, let snapshot = self.currentSnapshot() else { return }
+            self.send(snapshot: snapshot)
+        }
+    }
+
+    /// Carries out a snooze, stop or cancelled snooze of an alarm from the Watch. Returns false
+    /// when the message is something else.
+    private func handleAlarmCommand(_ message: [String: Any]) -> Bool {
+        guard let data = message[WatchAlarmCommand.payloadKey] as? Data else { return false }
+        guard let command = try? WatchAlarmCommand.decoded(from: data) else {
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: unreadable alarm command from the Watch")
+            return true
+        }
+        // Alarms belong to the main thread, and can't be read before the first unlock after a restart.
+        DispatchQueue.main.async {
+            guard StorageReadiness.ready.value else { return }
+            LogManager.shared.log(category: .watch, message: "WatchConnectivityManager: alarm \(command) from the Watch")
+            switch command {
+            case let .snooze(answer, units):
+                self.answeredFromWatch = "\(answer.id.uuidString)@\(answer.since)"
+                AlarmManager.shared.snooze(answer, units: units)
+            case let .stop(answer):
+                self.answeredFromWatch = "\(answer.id.uuidString)@\(answer.since)"
+                AlarmManager.shared.stop(answer)
+            case let .cancelSnoozes(id, until, allUntil):
+                AlarmManager.shared.cancelSnoozes(alarmID: id, until: until, allUntil: allUntil)
+            }
+        }
+        return true
     }
 }

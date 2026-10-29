@@ -60,6 +60,7 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         WatchSessionReceiver.shared.applyHistory(from: WCSession.default.receivedApplicationContext)
         WatchSessionReceiver.shared.applyTreatments(from: WCSession.default.receivedApplicationContext)
         WatchSessionReceiver.shared.applyStats(from: WCSession.default.receivedApplicationContext)
+        WatchSessionReceiver.shared.applyAlarms(from: WCSession.default.receivedApplicationContext)
         let contextSnapshot = Self.decodeContextSnapshot()
         let storeSnapshot = GlucoseSnapshotStore.shared.load()
 
@@ -83,7 +84,6 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         if let ctx = contextSnapshot,
            ctx.updatedAt > (storeSnapshot?.updatedAt ?? .distantPast)
         {
-            WatchAlertManager.shared.checkAndAlert(snapshot: ctx)
             // Recorded like any other delivery, so a poll that finds the same reading doesn't
             // count it as new, save a BG-only copy over this one and reload again.
             let isNewReading = ComplicationRefreshCounter.shared.shouldReloadAndRecord(for: ctx)

@@ -63,8 +63,15 @@ enum WatchRefreshPolicy {
         return completesWatchFetch || newerLoopRun || fillsIn
     }
 
-    /// Whether the phone may spend one of the daily high-priority complication transfers.
-    static func isComplicationPushDue(now: Date, lastPush: Date, remainingTransfers: Int) -> Bool {
-        remainingTransfers > 0 && now.timeIntervalSince(lastPush) >= complicationPushInterval
+    /// High-priority complication transfers kept for alarms: the routine ones stop while only this
+    /// many of the day's are left.
+    static let alarmTransferReserve = 10
+
+    /// Whether the phone may spend one of the daily high-priority complication transfers: one every
+    /// `complicationPushInterval` while more than the reserve is left, or at once while any is, when
+    /// `urgent`, for an alarm starting or ending, which the Watch should sound or fall quiet with.
+    static func isComplicationPushDue(now: Date, lastPush: Date, remainingTransfers: Int, urgent: Bool = false) -> Bool {
+        if urgent { return remainingTransfers > 0 }
+        return remainingTransfers > alarmTransferReserve && now.timeIntervalSince(lastPush) >= complicationPushInterval
     }
 }

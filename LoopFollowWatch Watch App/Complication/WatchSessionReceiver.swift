@@ -132,6 +132,22 @@ final class WatchSessionReceiver: NSObject {
         }
         DispatchQueue.main.async(execute: check)
     }
+
+    /// Calls `completion` on the main queue with true once WatchConnectivity is activated, or with
+    /// false after `timeout`. A notification's action can launch the app before it is.
+    func whenActivated(timeout: TimeInterval = 5, completion: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(timeout)
+        func check() {
+            if WCSession.default.activationState == .activated {
+                completion(true)
+            } else if Date() >= deadline {
+                completion(false)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: check)
+            }
+        }
+        DispatchQueue.main.async(execute: check)
+    }
 }
 
 // MARK: - WCSessionDelegate
@@ -242,6 +258,23 @@ extension WatchSessionReceiver: WCSessionDelegate {
         }
     }
 
+    /// Hands the phone's alarm state carried in a payload to the alert manager, with the reading it
+    /// came with, which the alarm's notification shows before the store has it. Every copy goes, as
+    /// each is the phone's word that an alarm is still sounding, which keeps it repeating.
+    func applyAlarms(from payload: [String: Any]) {
+        guard let data = payload[WatchAlarmState.payloadKey] as? Data else { return }
+        do {
+            let state = try WatchAlarmState.decoded(from: data)
+            let sentAt = payload[WatchAlarmState.sentAtKey] as? TimeInterval ?? 0
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let reading = (payload["snapshot"] as? Data).flatMap { try? decoder.decode(GlucoseSnapshot.self, from: $0) }
+            WatchAlertManager.shared.apply(state, sentAt: sentAt, reading: reading)
+        } catch {
+            os_log("WatchSessionReceiver: alarm state decode failed — %{public}@", log: watchLog, type: .error, error.localizedDescription)
+        }
+    }
+
     /// Persists the iPhone's 24-hour stats summary carried in a payload.
     func applyStats(from payload: [String: Any]) {
         guard let data = payload[WatchStatsSummary.payloadKey] as? Data,
@@ -258,6 +291,7 @@ extension WatchSessionReceiver: WCSessionDelegate {
         applyHistory(from: session.receivedApplicationContext)
         applyTreatments(from: session.receivedApplicationContext)
         applyStats(from: session.receivedApplicationContext)
+        applyAlarms(from: session.receivedApplicationContext)
         guard let data = session.receivedApplicationContext["snapshot"] as? Data else { return }
         do {
             let decoder = JSONDecoder()
@@ -313,6 +347,7 @@ extension WatchSessionReceiver: WCSessionDelegate {
         applyHistory(from: payload)
         applyTreatments(from: payload)
         applyStats(from: payload)
+        applyAlarms(from: payload)
 
         if let _ = payload["watchLoopReturn"] {
             let title = payload["title"] as? String ?? "Loop Confirmed ✓"
@@ -333,7 +368,6 @@ extension WatchSessionReceiver: WCSessionDelegate {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let snapshot = try decoder.decode(GlucoseSnapshot.self, from: data)
-            WatchAlertManager.shared.checkAndAlert(snapshot: snapshot)
             let (save, isNewReading) = gate(snapshot)
             guard save else {
                 DispatchQueue.main.async { self.completeHeldTasksIfIdle() }

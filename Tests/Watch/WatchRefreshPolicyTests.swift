@@ -87,18 +87,33 @@ struct WatchRefreshPolicyTests {
     @Test("#push is due after the interval when transfers remain")
     func pushDue() {
         let last = now.addingTimeInterval(-WatchRefreshPolicy.complicationPushInterval)
-        #expect(WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 5))
+        #expect(WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 20))
     }
 
     @Test("#push is not due inside the interval")
     func pushTooSoon() {
         let last = now.addingTimeInterval(-WatchRefreshPolicy.complicationPushInterval + 1)
-        #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 5))
+        #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 20))
+    }
+
+    @Test("#routine pushes leave the last transfers of the day to alarms")
+    func pushReserve() {
+        let reserve = WatchRefreshPolicy.alarmTransferReserve
+        #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: .distantPast, remainingTransfers: reserve))
+        #expect(WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: .distantPast, remainingTransfers: reserve + 1))
+        #expect(WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: .distantPast, remainingTransfers: 1, urgent: true))
     }
 
     @Test("#push is never due once the daily budget is spent")
     func pushBudgetSpent() {
         #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: .distantPast, remainingTransfers: 0))
+    }
+
+    @Test("#an alarm starting or ending pushes inside the interval, while transfers remain")
+    func urgentPush() {
+        let last = now.addingTimeInterval(-60)
+        #expect(WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 1, urgent: true))
+        #expect(!WatchRefreshPolicy.isComplicationPushDue(now: now, lastPush: last, remainingTransfers: 0, urgent: true))
     }
 
     // MARK: - Another copy of the same reading

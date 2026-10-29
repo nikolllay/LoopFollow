@@ -220,7 +220,9 @@ struct Alarm: Identifiable, Codable, Equatable {
 
     /// Function for when the alarm is triggered.
     /// If this alarm, all alarms is disabled or snoozed, then should not be called. This or all alarmd could be muted, then this function will just generate a notification.
-    func trigger(config: AlarmConfiguration, now: Date) {
+    /// Returns whether its sound plays, and whether it repeats, for the Watch to sound it the same way.
+    @discardableResult
+    func trigger(config: AlarmConfiguration, now: Date) -> (playsSound: Bool, repeats: Bool) {
         LogManager.shared.log(category: .alarm, message: "Alarm triggered: \(type.rawValue)")
 
         var playSound = true
@@ -285,6 +287,8 @@ struct Alarm: Identifiable, Codable, Equatable {
             let delay = shouldRepeat ? soundDelay : 0
             AlarmSound.play(repeating: shouldRepeat, delay: delay)
         }
+
+        return (playSound, shouldRepeat)
     }
 
     init(type: AlarmType) {

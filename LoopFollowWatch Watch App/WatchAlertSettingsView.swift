@@ -3,8 +3,8 @@
 
 import SwiftUI
 
-/// The Watch's settings: display options and the delivery diagnostics. The Watch's own
-/// alerts run on their defaults and are snoozed from the alert itself.
+/// The Watch's settings: display options and the delivery diagnostics. Its alarms are the
+/// phone's, set up there, and are snoozed from the alarm itself.
 struct WatchAlertSettingsView: View {
     @StateObject private var settings = WatchAppSettings.shared
     @ObservedObject var model: WatchViewModel

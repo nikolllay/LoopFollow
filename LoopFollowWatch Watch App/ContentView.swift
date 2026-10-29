@@ -106,7 +106,7 @@ struct ContentView: View {
             // Picks up a snooze just set, among other things.
             model.refresh()
             // A snooze asked for while a remote screen was open, now that it has closed.
-            if model.showSnoozeSheet, sheet == nil { sheet = .snooze }
+            if model.showSnoozeSheet, sheet == nil, model.isPendingSnoozeSounding { sheet = .snooze }
         }) { shown in
             switch shown {
             case let .command(screen):
@@ -121,7 +121,11 @@ struct ContentView: View {
                     )
                 }
             case .snooze:
-                SnoozeView(isPresented: snoozeShown, alertType: model.pendingSnoozeType)
+                if let sounding = model.pendingSnooze {
+                    // A fresh screen for each alarm, so one's length isn't carried to the next.
+                    SnoozeView(isPresented: snoozeShown, sounding: sounding)
+                        .id(sounding.key)
+                }
             }
         }
         // An alert's Snooze action asks for the snooze sheet. It takes the place of the ages, but
@@ -130,11 +134,22 @@ struct ContentView: View {
         .onChange(of: model.showSnoozeSheet, initial: true) { _, show in
             guard show else { return }
             if case .command = sheet { return }
+            guard model.isPendingSnoozeSounding else {
+                model.showSnoozeSheet = false
+                return
+            }
             sheet = .snooze
         }
         .onChange(of: sheet) { old, new in
             // The snooze sheet has closed, or a shortcut has taken its place.
             if old == .snooze, new != .snooze { model.showSnoozeSheet = false }
+        }
+        .onChange(of: model.soundingKey) { _, key in
+            // Its alarm is over, or another has taken its place: nothing is left to snooze on it,
+            // whether the sheet is up or waiting for a remote screen to close.
+            guard key != model.pendingSnooze?.key else { return }
+            if sheet == .snooze { sheet = nil }
+            model.showSnoozeSheet = false
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
             // Opening the app starts on the glucose page. Raising the wrist after just lowering
@@ -198,9 +213,18 @@ final class WatchViewModel: ObservableObject {
     @Published var snapshot: GlucoseSnapshot?
     @Published var selectedSlots: [LiveActivitySlotOption] = LAAppGroupSettings.watchSelectedSlots()
     @Published var showSnoozeSheet = false
-    @Published var pendingSnoozeType: WatchAlertType?
-    /// What the glucose page offers for the Watch's alerts.
+    /// The alarm the snooze sheet is for.
+    @Published var pendingSnooze: WatchAlarmState.Sounding?
+    /// What the glucose page offers for the phone's alarms.
     @Published var snoozeStatus = WatchAlertManager.SnoozeStatus.none
+    /// Which sounding of the phone's alarms is unanswered here, if one is.
+    @Published var soundingKey: String?
+
+    /// The snooze sheet's alarm is still sounding, so there's something to snooze.
+    var isPendingSnoozeSounding: Bool {
+        pendingSnooze != nil && WatchAlertManager.shared.currentSounding()?.key == pendingSnooze?.key
+    }
+
     @Published var remoteEnabled = LAAppGroupSettings.isWatchRemoteEnabled()
     @Published var history: [WatchGlucoseHistory.Point] = WatchGlucoseHistory.load()?.points ?? []
     @Published var treatments: [WatchTreatmentHistory.Treatment] = WatchTreatmentHistory.load()?.treatments ?? []
@@ -265,8 +289,9 @@ final class WatchViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let typeRaw = notification.userInfo?["alertType"] as? String
-            self?.pendingSnoozeType = typeRaw.flatMap { WatchAlertType(rawValue: $0) }
+            let id = (notification.userInfo?["alarmID"] as? String).flatMap(UUID.init(uuidString:))
+            guard let sounding = WatchAlertManager.shared.currentSounding(), sounding.id == id else { return }
+            self?.pendingSnooze = sounding
             self?.showSnoozeSheet = true
         }
     }
@@ -309,7 +334,8 @@ final class WatchViewModel: ObservableObject {
         // Also after a bolus from the Watch, which the remote screens record as they close.
         setIfChanged(\.recommendedBolus, snapshot.flatMap { Self.recommendation(for: $0) })
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
-        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus(for: snapshot))
+        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus())
+        setIfChanged(\.soundingKey, WatchAlertManager.shared.currentSounding()?.key)
         setIfChanged(\.remoteEnabled, LAAppGroupSettings.isWatchRemoteEnabled())
         setIfChanged(\.bgColors, GlucoseColor.Scheme.current())
         setIfChanged(\.pumpAgeColoring, LAAppGroupSettings.watchPumpAgeColoring())
@@ -321,7 +347,8 @@ final class WatchViewModel: ObservableObject {
         setIfChanged(\.snapshot, snapshot)
         setIfChanged(\.recommendedBolus, Self.recommendation(for: snapshot))
         setIfChanged(\.selectedSlots, LAAppGroupSettings.watchSelectedSlots())
-        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus(for: snapshot))
+        setIfChanged(\.snoozeStatus, WatchAlertManager.shared.snoozeStatus())
+        setIfChanged(\.soundingKey, WatchAlertManager.shared.currentSounding()?.key)
         loadHistories()
     }
 
@@ -386,7 +413,7 @@ struct GlucoseView: View {
                 // Colored like the BG, so a predicted low or high stands out.
                 let projectedColor = s.projected.map { model.bgColors.color(forMgdl: $0) } ?? .white
                 // During an alarm the rows give up a little of their size to the snooze button.
-                let textFactor = WatchLayout.textFactor(for: typeSize) * (model.snoozeStatus == .active ? 0.9 : 1)
+                let textFactor = WatchLayout.textFactor(for: typeSize) * (model.snoozeStatus.isActive ? 0.9 : 1)
                 // Ticks every second so the counter's color, and the switch to "--" once the
                 // reading is too old, land on time. A tick only works out the freshness; the page
                 // redraws when that, the reading or its color changes. An explicit schedule for
@@ -404,15 +431,15 @@ struct GlucoseView: View {
                         alert: model.snoozeStatus,
                         onRefresh: model.requestRefresh,
                         onSnooze: {
-                            model.pendingSnoozeType = nil
+                            model.pendingSnooze = WatchAlertManager.shared.currentSounding()
                             model.showSnoozeSheet = true
                         },
                         onStop: {
-                            WatchAlertManager.shared.stopAll()
+                            WatchAlertManager.shared.stopSounding()
                             model.refresh()
                         },
                         onCancelSnooze: {
-                            WatchAlertManager.shared.cancelAllSnoozes()
+                            WatchAlertManager.shared.cancelSnoozes()
                             model.refresh()
                         }
                     )
@@ -628,15 +655,15 @@ private struct GlucoseReadingView: View, Equatable {
         }
     }
 
-    /// While an alarm sounds, buttons to snooze it, or to stop it and leave alerts on; while
-    /// alerts are snoozed, until when, with a button to cancel. Nothing otherwise, and then the
-    /// page is as usual; with it, the BG number makes room.
+    /// While the phone's alarm sounds, buttons to snooze it, or to stop it without a snooze when the
+    /// phone allows that; while alarms are snoozed, until when, with a button to cancel. Nothing
+    /// otherwise, and then the page is as usual; with it, the BG number makes room.
     @ViewBuilder
     private var snoozeLine: some View {
         switch alert {
         case .none:
             EmptyView()
-        case .active:
+        case let .active(canStop):
             // Large and easy to hit during an alarm; the BG number and the rows make room for them.
             HStack(spacing: WatchLayout.scaled(6)) {
                 Button(action: onSnooze) {
@@ -645,14 +672,16 @@ private struct GlucoseReadingView: View, Equatable {
                         .padding(.vertical, WatchLayout.scaled(7))
                         .background(Color.orange.opacity(0.25), in: Capsule())
                 }
-                Button(action: onStop) {
-                    Text("Stop")
-                        .padding(.horizontal, WatchLayout.scaled(12))
-                        .padding(.vertical, WatchLayout.scaled(7))
-                        .background(Color.white.opacity(0.15), in: Capsule())
+                if canStop {
+                    Button(action: onStop) {
+                        Text("Stop")
+                            .padding(.horizontal, WatchLayout.scaled(12))
+                            .padding(.vertical, WatchLayout.scaled(7))
+                            .background(Color.white.opacity(0.15), in: Capsule())
+                    }
+                    .foregroundColor(.white)
+                    .accessibilityHint("Stops the alarm without a snooze; it sounds again if still due")
                 }
-                .foregroundColor(.white)
-                .accessibilityHint("Stops the alarm; alerts stay on")
             }
             .buttonStyle(.plain)
             .font(.system(size: WatchLayout.scaled(19), weight: .bold))
@@ -663,13 +692,13 @@ private struct GlucoseReadingView: View, Equatable {
         case let .snoozed(until):
             HStack(spacing: WatchLayout.scaled(6)) {
                 Label {
-                    Text("until \(until, style: .time)")
+                    Text("until \(Self.snoozeEnd(until))")
                 } icon: {
                     Image(systemName: "bell.slash.fill")
                 }
                 .lineLimit(1)
                 .minimumScaleFactor(Self.minimumScale)
-                .accessibilityLabel("Alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))")
+                .accessibilityLabel("Alerts snoozed until \(Self.snoozeEnd(until))")
                 Spacer(minLength: 0)
                 Button("Cancel", action: onCancelSnooze)
                     .buttonStyle(.plain)
@@ -681,6 +710,18 @@ private struct GlucoseReadingView: View, Equatable {
             .font(.system(size: statusFontSize * 0.9, weight: .semibold))
             .foregroundColor(.orange)
             .padding(.top, WatchLayout.scaled(2))
+        }
+    }
+
+    /// When a snooze ends: the time if that's today, with the weekday within the week, and with the
+    /// date further off, as the phone's snoozes can last days.
+    private static func snoozeEnd(_ until: Date) -> String {
+        let calendar = Calendar.current
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: Date()), to: calendar.startOfDay(for: until)).day ?? 0
+        switch days {
+        case ..<1: return until.formatted(date: .omitted, time: .shortened)
+        case ..<7: return until.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+        default: return until.formatted(.dateTime.month(.abbreviated).day().hour().minute())
         }
     }
 

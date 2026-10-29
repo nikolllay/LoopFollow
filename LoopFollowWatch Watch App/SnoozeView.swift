@@ -3,52 +3,41 @@
 
 import SwiftUI
 
+/// The phone's snooze screen, for the alarm sounding: its name, and how long to snooze it, from the
+/// lengths the phone offers for it. At 0 it stops it, as the phone's Acknowledge does.
 struct SnoozeView: View {
     @Binding var isPresented: Bool
-    let alertType: WatchAlertType?
+    let sounding: WatchAlarmState.Sounding
 
-    @StateObject private var settings = WatchAppSettings.shared
-    @State private var snoozeMinutes: Double
-    @State private var snoozeAll: Bool
+    @State private var units: Double
 
-    private let step: Double = 30
-    private let range: ClosedRange<Double> = 30 ... 720 // 30 min – 12 hr
-
-    init(isPresented: Binding<Bool>, alertType: WatchAlertType?) {
+    init(isPresented: Binding<Bool>, sounding: WatchAlarmState.Sounding) {
         _isPresented = isPresented
-        self.alertType = alertType
-        let s = WatchAppSettings.shared
-        _snoozeMinutes = State(initialValue: Double(s.defaultSnoozeMinutes))
-        _snoozeAll = State(initialValue: s.snoozeAllByDefault)
+        self.sounding = sounding
+        let range = sounding.snoozeRange
+        _units = State(initialValue: Double(min(max(sounding.snoozeUnits, range.lowerBound), range.upperBound)))
     }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 10) {
-                Text("Snooze Alerts")
+                Text(sounding.name)
                     .font(.headline)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
 
-                Text(formattedDuration)
-                    .font(.system(size: 32, weight: .bold, design: .rounded))
-                    .foregroundColor(.orange)
-                    .monospacedDigit()
+                if sounding.canChooseSnooze {
+                    Text(formattedDuration)
+                        .font(.system(size: 32, weight: .bold, design: .rounded))
+                        .foregroundColor(.orange)
+                        .monospacedDigit()
 
-                Slider(value: $snoozeMinutes, in: range, step: step)
+                    Slider(
+                        value: $units,
+                        in: Double(sounding.snoozeRange.lowerBound) ... Double(sounding.snoozeRange.upperBound),
+                        step: Double(max(1, sounding.snoozeStep))
+                    )
                     .tint(.orange)
-
-                // Scope toggle only shown when a specific alert type is known.
-                // When opened manually (alertType == nil), snooze is always global.
-                if alertType != nil {
-                    Toggle("Snooze all alerts", isOn: $snoozeAll)
-                        .font(.system(size: 13))
-                        .toggleStyle(.switch)
-                }
-
-                // A snooze of every alert doesn't reach urgent low unless it's the one sounding.
-                if snoozeAll || alertType == nil, alertType != .urgentLow, !WatchAlertManager.shared.isSounding(.urgentLow) {
-                    Text("Urgent Low will still sound")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
                 }
 
                 HStack(spacing: 16) {
@@ -57,9 +46,8 @@ struct SnoozeView: View {
                     }
                     .foregroundColor(.secondary)
 
-                    Button("Snooze") {
-                        let target: WatchAlertType? = (snoozeAll || alertType == nil) ? nil : alertType
-                        WatchAlertManager.shared.snooze(minutes: Int(snoozeMinutes), type: target)
+                    Button(chosenUnits == 0 ? "Stop" : "Snooze") {
+                        WatchAlertManager.shared.snooze(sounding, units: chosenUnits)
                         isPresented = false
                     }
                     .foregroundColor(.orange)
@@ -70,10 +58,18 @@ struct SnoozeView: View {
         }
     }
 
+    /// The length chosen, within what the phone offers for the alarm.
+    private var chosenUnits: Int {
+        min(max(Int(units), sounding.snoozeRange.lowerBound), sounding.snoozeRange.upperBound)
+    }
+
     private var formattedDuration: String {
-        let mins = Int(snoozeMinutes)
+        let mins = Int(sounding.snoozeDuration(units: chosenUnits) / 60)
         if mins < 60 { return "\(mins)m" }
-        let h = mins / 60, m = mins % 60
-        return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+        if mins < 24 * 60 {
+            let h = mins / 60, m = mins % 60
+            return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+        }
+        return "\(mins / (24 * 60))d"
     }
 }
