@@ -3,6 +3,7 @@
 
 import Combine
 import Foundation
+import UIKit
 import WatchConnectivity
 
 /// Phone side of the Apple Watch link. Publishes `WatchState` as the
@@ -24,6 +25,15 @@ final class WatchSessionManager: NSObject {
     private var lastSentCredentials: WatchCredentials?
     private var lastComplicationTransfer: Date = .distantPast
     private var cancellables = Set<AnyCancellable>()
+
+    /// When the watch last asked for a refresh; requests closer together than
+    /// `watchRefreshInterval` reuse the fetch already under way.
+    private var lastWatchRefresh: Date = .distantPast
+    private static let watchRefreshInterval: TimeInterval = 15
+    /// BG, device status and treatments land within a few seconds of a refresh.
+    private static let watchRefreshFetchTime: TimeInterval = 10
+    /// Background time held from a watch refresh until its fetches are done.
+    private var refreshBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private lazy var coalescer = RefreshCoalescer(delay: 2) { [weak self] reason in
         self?.publish(reason: reason)
     }
@@ -215,6 +225,17 @@ extension WatchSessionManager: WCSessionDelegate {
                 return
             }
 
+            if message[WatchMessageKey.requestRefresh] != nil {
+                let fetching = self.refreshForWatch()
+                // What the phone has now; the watch asks again once the fetches have landed.
+                var reply: [String: Any] = [WatchMessageKey.refreshing: fetching]
+                if StorageReadiness.ready.value, let data = WatchStateBuilder.build().encoded() {
+                    reply[WatchState.contextKey] = data
+                }
+                replyHandler(reply)
+                return
+            }
+
             guard let data = message[WatchCommand.messageKey] as? Data,
                   let command = try? JSONDecoder().decode(WatchCommand.self, from: data)
             else {
@@ -233,6 +254,43 @@ extension WatchSessionManager: WCSessionDelegate {
         if userInfo[WatchCredentials.requestKey] != nil {
             DispatchQueue.main.async { self.sendCredentialsIfChanged(force: true) }
         }
+    }
+
+    /// The watch's refresh button: re-runs every fetch now, as pulling down on the home screen
+    /// does. Returns false when the phone can't fetch (locked since a restart, or no data pipeline
+    /// yet), so the watch fetches itself. Call on the main thread.
+    private func refreshForWatch() -> Bool {
+        // Before the first unlock after a restart, settings can't be read yet; don't fetch with defaults.
+        guard StorageReadiness.ready.value, let vc = MainViewController.shared else { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastWatchRefresh) >= Self.watchRefreshInterval else { return true }
+        if UIApplication.shared.applicationState == .background {
+            // A message from the watch only wakes the app briefly; hold background time until the
+            // fetches are done. Without it iOS may suspend the app first, and the watch should
+            // fetch itself instead.
+            endRefreshBackgroundTask()
+            refreshBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "WatchRefresh") { [weak self] in
+                self?.endRefreshBackgroundTask()
+            }
+            guard refreshBackgroundTask != .invalid else { return false }
+            // The Nightscout socket is foreground-only and refresh() would reopen it, so only re-run the fetches.
+            vc.scheduleAllTasks()
+        } else {
+            vc.refresh()
+        }
+        lastWatchRefresh = now
+        LogManager.shared.log(category: .general, message: "[Watch] the watch asked for a refresh")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.watchRefreshFetchTime) { [weak self] in
+            self?.requestUpdate(reason: "watch refresh")
+            self?.endRefreshBackgroundTask()
+        }
+        return true
+    }
+
+    private func endRefreshBackgroundTask() {
+        guard refreshBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(refreshBackgroundTask)
+        refreshBackgroundTask = .invalid
     }
 
     private static func reply(_ reply: WatchCommandReply, to handler: ([String: Any]) -> Void) {

@@ -66,4 +66,9 @@ struct WatchCommandReply: Codable, Equatable {
 enum WatchMessageKey {
     /// Watch → phone: asks for the current state; the reply carries `WatchState.contextKey`.
     static let requestState = "requestState"
+    /// Watch → phone: asks the phone to fetch everything now, as pulling down on its home screen
+    /// does. The reply carries the current state and `refreshing`.
+    static let requestRefresh = "requestRefresh"
+    /// In the reply to `requestRefresh`: false when the phone can't fetch, so the watch fetches itself.
+    static let refreshing = "refreshing"
 }

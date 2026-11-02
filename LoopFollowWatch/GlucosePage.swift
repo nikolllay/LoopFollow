@@ -27,6 +27,11 @@ struct GlucosePage: View {
                 }
             }
             .toolbar {
+                if !isLuminanceReduced {
+                    ToolbarItem(placement: .topBarLeading) {
+                        RefreshButton()
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     age(now: context.date)
                 }
@@ -57,7 +62,16 @@ struct GlucosePage: View {
                             .fixedSize()
                             .alignmentGuide(.trailing) { $0[.leading] - 4 }
                     }
-                    .padding(.horizontal, 34)
+                    // Clear of the battery and reservoir on the left, and evenly on the right, so the BG stays centered.
+                    .padding(.horizontal, 44)
+                    // The phone's battery and the pump's reservoir, under the refresh button, level with the BG.
+                    .frame(maxWidth: .infinity)
+                    .overlay(alignment: .leading) {
+                        if !isLuminanceReduced {
+                            DeviceStatus(snapshot: snapshot)
+                                .offset(y: 8)
+                        }
+                    }
                 Text(WatchFormat.delta(snapshot.delta, unit: snapshot.unit))
                     .font(.title3)
                     .foregroundStyle(.secondary)
@@ -72,7 +86,12 @@ struct GlucosePage: View {
         }
     }
 
-    /// Age of the reading, with a marker while the watch fetches on its own or cannot reach the phone.
+    /// Readings come every 5 minutes; the counter turns yellow once one is due.
+    private static let agingAfter: TimeInterval = 5 * 60
+
+    /// Age of the reading, counting up every second from 0:00, so a missed reading shows as
+    /// 6:34, 6:35…: green, yellow once the next reading is due, red once the reading is stale.
+    /// With a marker while the watch fetches on its own or cannot reach the phone.
     @ViewBuilder
     private func age(now: Date) -> some View {
         HStack(spacing: 2) {
@@ -86,8 +105,10 @@ struct GlucosePage: View {
                     .accessibilityLabel("iPhone not reachable")
             }
             if let snapshot = state.snapshot {
-                Text(WatchFormat.minutesAgo(snapshot.updatedAt, now: now))
-                    .foregroundStyle(now.timeIntervalSince(snapshot.updatedAt) >= WatchFormat.staleAfter ? .red : .secondary)
+                let age = now.timeIntervalSince(snapshot.updatedAt)
+                Text(snapshot.updatedAt, style: .timer)
+                    .monospacedDigit()
+                    .foregroundStyle(age >= WatchFormat.staleAfter ? .red : age >= Self.agingAfter ? .yellow : .green)
             }
         }
         .font(.footnote)
@@ -101,22 +122,29 @@ struct GlucosePage: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
             } else if snapshot.iob != nil || snapshot.cob != nil {
-                HStack(spacing: 12) {
-                    if let iob = snapshot.iob {
-                        Text("\(Image(systemName: "syringe")) \(WatchFormat.iob(iob))")
-                            .accessibilityLabel("Insulin on board \(WatchFormat.iob(iob))")
-                    }
-                    if let cob = snapshot.cob {
-                        Text("\(Image(systemName: "fork.knife")) \(WatchFormat.cob(cob))")
-                            .accessibilityLabel("Carbs on board \(WatchFormat.cob(cob))")
-                    }
+                // Large enough to read at a glance; a size smaller, both alike, when the pair doesn't fit.
+                ViewThatFits(in: .horizontal) {
+                    insulinAndCarbs(snapshot, font: .body)
+                    insulinAndCarbs(snapshot, font: .footnote)
                 }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
             }
         }
+    }
+
+    private func insulinAndCarbs(_ snapshot: GlucoseSnapshot, font: Font) -> some View {
+        HStack(spacing: 12) {
+            if let iob = snapshot.iob {
+                Text("\(Image(systemName: "syringe")) \(WatchFormat.iob(iob))")
+                    .accessibilityLabel("Insulin on board \(WatchFormat.iob(iob))")
+            }
+            if let cob = snapshot.cob {
+                Text("\(Image(systemName: "fork.knife")) \(WatchFormat.cob(cob))")
+                    .accessibilityLabel("Carbs on board \(WatchFormat.cob(cob))")
+            }
+        }
+        .font(font)
+        .lineLimit(1)
+        .fixedSize()
     }
 
     /// The running override's name and insulin needs.
@@ -220,6 +248,68 @@ struct Sparkline: View {
         .chartXAxis(.hidden)
         .chartYAxis(.hidden)
         .accessibilityHidden(true)
+    }
+}
+
+/// The phone's battery, then the pump's reservoir, in small text colored like the delta: the battery red under 20 %,
+/// with a green bolt in place of the battery while it charges, as on the phone.
+private struct DeviceStatus: View {
+    let snapshot: GlucoseSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let battery = snapshot.battery {
+                (batteryIcon(battery) + Text(" \(Int(battery.rounded()))%"))
+                    .foregroundStyle(battery < 20 ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                    .accessibilityLabel("Phone battery \(Int(battery.rounded())) percent\(snapshot.batteryIsCharging == true ? ", charging" : "")")
+            }
+            if let reservoir = snapshot.pumpReservoirU {
+                Text("\(Int(reservoir.rounded()))U")
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Reservoir \(Int(reservoir.rounded())) units")
+            }
+        }
+        .font(.caption2)
+        .monospacedDigit()
+        .lineLimit(1)
+    }
+
+    private func batteryIcon(_ percent: Double) -> Text {
+        guard snapshot.batteryIsCharging == true else {
+            return Text(Image(systemName: Self.batterySymbol(percent)))
+        }
+        return Text(Image(systemName: "bolt.fill")).foregroundColor(.green)
+    }
+
+    /// A battery that empties with the level, like the system's.
+    private static func batterySymbol(_ percent: Double) -> String {
+        switch percent {
+        case ..<13: return "battery.0percent"
+        case ..<38: return "battery.25percent"
+        case ..<63: return "battery.50percent"
+        case ..<88: return "battery.75percent"
+        default: return "battery.100percent"
+        }
+    }
+}
+
+/// Fetches the latest data now: through the phone when it's in reach, otherwise straight from
+/// Nightscout or Dexcom. A spinner takes the icon's place while the fetch is under way.
+struct RefreshButton: View {
+    @EnvironmentObject private var session: WatchSession
+
+    var body: some View {
+        Button {
+            Task { await session.refreshNow() }
+        } label: {
+            if session.isRefreshing {
+                ProgressView()
+            } else {
+                Image(systemName: "arrow.triangle.2.circlepath")
+            }
+        }
+        .disabled(session.isRefreshing)
+        .accessibilityLabel(session.isRefreshing ? "Refreshing" : "Refresh")
     }
 }
 

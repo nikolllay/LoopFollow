@@ -24,6 +24,8 @@ final class WatchSession: NSObject, ObservableObject {
 
     @Published private(set) var state: WatchState?
     @Published private(set) var isReachable = false
+    /// True while the refresh button's fetch is under way.
+    @Published private(set) var isRefreshing = false
 
     private var session: WCSession { WCSession.default }
     private var credentials: WatchCredentials?
@@ -63,6 +65,88 @@ final class WatchSession: NSObject, ObservableObject {
             guard let data = reply[WatchState.contextKey] as? Data else { return }
             Task { @MainActor in self.applyFromPhone(data) }
         }, errorHandler: nil)
+    }
+
+    /// After asking the phone to refresh, when to ask for what it fetched: once its fetches have
+    /// had time to land, and once more if that brought no newer reading.
+    private static let refreshFollowUps: [TimeInterval] = [8, 15]
+
+    /// The refresh button: asks the phone to fetch everything now, as pulling down on its home
+    /// screen does, and takes what it fetched a few seconds later. When the phone is out of reach
+    /// or can't fetch, fetches from Nightscout or Dexcom itself. The button shows it under way
+    /// until a newer reading is in, or the phone's fetches have had time to land, and never longer
+    /// than `refreshShownFor`.
+    func refreshNow() async {
+        guard !isRefreshing else { return }
+        refreshID += 1
+        let id = refreshID
+        isRefreshing = true
+        defer { endRefreshShown(id) }
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(Self.refreshShownFor * 1_000_000_000))
+            endRefreshShown(id)
+        }
+        WKInterfaceDevice.current().play(.click)
+
+        let before = state?.snapshot?.updatedAt
+        let hasNewerReading = { self.state?.snapshot?.updatedAt != before }
+        if session.activationState == .activated, session.isReachable,
+           let phoneIsFetching = await askPhone(WatchMessageKey.requestRefresh),
+           phoneIsFetching
+        {
+            var elapsed: TimeInterval = 0
+            for (index, delay) in Self.refreshFollowUps.enumerated() {
+                // A newer reading arriving any way ends the wait at once.
+                while elapsed < delay, !hasNewerReading() {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    elapsed += 1
+                }
+                if hasNewerReading() { return }
+                _ = await askPhone(WatchMessageKey.requestState)
+                if hasNewerReading() { return }
+                // The first check comes once the phone's fetches have landed; the rest go on
+                // without the button showing a refresh.
+                if index == 0 { endRefreshShown(id) }
+            }
+            return
+        }
+
+        guard let credentials, credentials.hasDataSource, var fetched = await fetchStandalone(credentials) else { return }
+        // Only a newer reading than the one shown replaces it; the phone's alarm stays while its state is fresh.
+        guard (fetched.snapshot?.updatedAt ?? .distantPast) > (state?.snapshot?.updatedAt ?? .distantPast) else { return }
+        if isPhoneDataFresh {
+            fetched.alarm = state?.alarm
+        }
+        store(fetched)
+    }
+
+    /// Longest the refresh button shows a refresh, however long the phone or the network take.
+    private static let refreshShownFor: TimeInterval = 10
+    /// Which refresh the button is showing, so an older one that finishes late doesn't end a newer one's.
+    private var refreshID = 0
+
+    private func endRefreshShown(_ id: Int) {
+        if refreshID == id { isRefreshing = false }
+    }
+
+    /// Sends a request to the phone and applies the state in its reply. Returns the reply's
+    /// `refreshing` flag (true when absent), or nil when the phone didn't answer.
+    private func askPhone(_ key: String) async -> Bool? {
+        let reply: (refreshing: Bool, state: Data?)? = await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            session.sendMessage([key: true], replyHandler: { reply in
+                once.resume((reply[WatchMessageKey.refreshing] as? Bool ?? true, reply[WatchState.contextKey] as? Data))
+            }, errorHandler: { _ in
+                once.resume(nil)
+            })
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                once.resume(nil)
+            }
+        }
+        if let data = reply?.state {
+            applyFromPhone(data)
+        }
+        return reply?.refreshing
     }
 
     /// Fetches from Nightscout or Dexcom when the phone's data is stale and the phone does not answer.
